@@ -2,7 +2,7 @@
 
 use doppler_kit::{fit, input::RawFormat, slr, trace};
 use eframe::egui::{self, Align2, Color32, ColorImage, Id, RichText, TextStyle, TextureHandle, TextureOptions};
-use egui_plot::{Arrows, HLine, Legend, Line, LineStyle, MarkerShape, Plot, PlotImage, PlotPoint, PlotUi, Points, Text, VLine};
+use egui_plot::{uniform_grid_spacer, Arrows, Corner, GridInput, HLine, Legend, Line, LineStyle, MarkerShape, Plot, PlotImage, PlotPoint, PlotTransform, PlotUi, Points, Text, VLine};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
 
@@ -11,6 +11,12 @@ const RED: Color32 = Color32::from_rgb(0xfc, 0x81, 0x81);
 const GOLD: Color32 = Color32::from_rgb(0xf6, 0xc3, 0x4a);
 const YELLOW: Color32 = Color32::from_rgb(0xff, 0xd2, 0x3f);
 const GREY: Color32 = Color32::from_gray(150);
+const GREEN: Color32 = Color32::from_rgb(0x68, 0xd3, 0x91);
+const PURPLE: Color32 = Color32::from_rgb(0xc0, 0x9a, 0xff);
+/// Waterfall brightness: dB above the row median shown from black (first) to full (second).
+const WF_DB: [f32; 2] = [5.0, 20.0];
+/// Largest waterfall image side, about one screen pixel per image pixel.
+const WF_PX: usize = 1024;
 
 pub fn run() -> Result<(), String> {
     let opts = eframe::NativeOptions {
@@ -28,7 +34,7 @@ pub fn run() -> Result<(), String> {
 enum Wave { Radio, Sound, Other }
 
 #[derive(PartialEq, Clone, Copy)]
-enum Tab { Results, Waterfall, SCurve, Marked, Laser }
+enum Tab { Results, Waterfall, SCurve, Marked, Laser, Math }
 
 enum Msg {
     Log(String),
@@ -46,6 +52,9 @@ struct App {
     log: String, results: String, tab: Tab, rx: Option<Receiver<Msg>>,
     trace: Option<trace::TraceResult>, fit: Option<(fit::FitResult, PathBuf)>, laser: Option<(slr::SlrRun, String)>,
     wf_tex: Option<TextureHandle>,
+    /// Counts runs; part of every plot id so a new run starts from its default view.
+    run: u64,
+    show_trace: bool,
     picker: Option<Receiver<(bool, PathBuf)>>,
 }
 
@@ -55,7 +64,7 @@ impl Default for App {
             file: String::new(), centre: String::new(), start: String::new(), wave: Wave::Radio, c_other: String::new(),
             f0: String::new(), span: "15000".into(), rate: String::new(), fmt: RawFormat::Cs16, swap: false, which: "0".into(),
             out: String::new(), log: String::new(), results: String::new(), tab: Tab::Results, rx: None,
-            trace: None, fit: None, laser: None, wf_tex: None, picker: None,
+            trace: None, fit: None, laser: None, wf_tex: None, run: 0, show_trace: true, picker: None,
         }
     }
 }
@@ -93,31 +102,68 @@ fn work(job: Job, tx: &Sender<Msg>, ctx: &egui::Context) -> Result<(), String> {
     Ok(())
 }
 
-fn viridis(x: f32) -> Color32 {
-    const S: [[u8; 3]; 9] = [[68, 1, 84], [72, 40, 120], [62, 73, 137], [49, 104, 142], [38, 130, 142],
-        [31, 158, 137], [53, 183, 121], [110, 206, 88], [253, 231, 37]];
+/// Inferno colour map (perceptual, black to pale yellow), x in 0..1.
+fn inferno(x: f32) -> Color32 {
+    const S: [[u8; 3]; 9] = [[0, 0, 4], [31, 12, 72], [85, 15, 109], [136, 34, 106], [186, 54, 85],
+        [227, 89, 51], [249, 140, 10], [249, 201, 50], [252, 255, 164]];
     let x = if x.is_finite() { x.clamp(0.0, 1.0) * 8.0 } else { 0.0 };
     let (i, u) = ((x as usize).min(7), x - (x as usize).min(7) as f32);
     let m = |k: usize| (S[i][k] as f32 + (S[i + 1][k] as f32 - S[i][k] as f32) * u) as u8;
     Color32::from_rgb(m(0), m(1), m(2))
 }
 
-/// Waterfall as an image on viridis 0..15 dB, time upwards; blocks are max-pooled to fit the GPU texture limit.
+/// Waterfall as an image, time upwards. Each row is taken relative to its own median and shown on inferno over WF_DB.
+/// Blocks are pooled down to WF_PX: power averaged over time (less speckle), then the strongest bin (thin lines survive).
 fn waterfall_image(w: &trace::Waterfall, max_side: usize) -> ColorImage {
     let (nt, nf) = (w.t.len(), w.f.len());
-    let (by, bx) = (nt.div_ceil(max_side).max(1), nf.div_ceil(max_side).max(1));
+    let med: Vec<f32> = (0..nt).map(|i| {
+        let mut r = w.db[i * nf..(i + 1) * nf].to_vec();
+        r.sort_by(f32::total_cmp);
+        r[nf / 2]
+    }).collect();
+    let side = max_side.min(WF_PX);
+    let (by, bx) = (nt.div_ceil(side).max(1), nf.div_ceil(side).max(1));
     let (h, wd) = (nt.div_ceil(by), nf.div_ceil(bx));
     let mut px = Vec::with_capacity(h * wd);
     for r in (0..h).rev() {
         for c in 0..wd {
-            let mut m = f32::NEG_INFINITY;
-            for i in r * by..((r + 1) * by).min(nt) {
-                for j in c * bx..((c + 1) * bx).min(nf) { m = m.max(w.db[i * nf + j]); }
-            }
-            px.push(viridis(m / 15.0));
+            let rows = r * by..((r + 1) * by).min(nt);
+            let m = (c * bx..((c + 1) * bx).min(nf)).map(|j| {
+                rows.clone().map(|i| 10f32.powf((w.db[i * nf + j] - med[i]) / 10.0)).sum::<f32>() / rows.len() as f32
+            }).fold(0.0f32, f32::max);
+            px.push(inferno((10.0 * m.log10() - WF_DB[0]) / (WF_DB[1] - WF_DB[0])));
         }
     }
     ColorImage::new([wd, h], px)
+}
+
+/// Default waterfall view: the measured trace's frequency range plus a margin (kHz) and the whole recording (s).
+fn signal_view(t: &trace::TraceResult) -> ([f64; 2], [f64; 2]) {
+    let w = &t.waterfall;
+    let (f0, f1) = (w.f[0] / 1e3, w.f[w.f.len() - 1] / 1e3);
+    let (lo, hi) = t.points.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |a, p| (a.0.min(p.f_offset / 1e3), a.1.max(p.f_offset / 1e3)));
+    let m = (0.15 * (hi - lo)).max(1.0);
+    let x = [(lo - m).max(f0), (hi + m).min(f1)];
+    (if x[0] < x[1] { x } else { [f0, f1] }, [w.t[0], w.t[w.t.len() - 1]])
+}
+
+/// Range of finite values, or None.
+fn extent<'a>(v: impl IntoIterator<Item = &'a f64>) -> Option<[f64; 2]> {
+    let r = v.into_iter().filter(|x| x.is_finite()).fold([f64::INFINITY, f64::NEG_INFINITY], |a, &x| [a[0].min(x), a[1].max(x)]);
+    (r[0] < r[1]).then_some(r)
+}
+
+/// Strip under the waterfall title: what brightness means.
+fn colour_bar(ui: &mut egui::Ui) {
+    ui.label(format!("brightness = power above the row median:  {:.0} dB (noise)", WF_DB[0]));
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(160.0, 14.0), egui::Sense::hover());
+    const N: usize = 64;
+    for i in 0..N {
+        let x0 = rect.left() + rect.width() * i as f32 / N as f32;
+        let r = egui::Rect::from_min_max(egui::pos2(x0, rect.top()), egui::pos2(x0 + rect.width() / N as f32 + 0.5, rect.bottom()));
+        ui.painter().rect_filled(r, 0.0, inferno(i as f32 / (N - 1) as f32));
+    }
+    ui.label(format!("{:.0} dB+", WF_DB[1]));
 }
 
 fn linspace(a: f64, b: f64, n: usize) -> Vec<f64> {
@@ -132,6 +178,29 @@ fn field(ui: &mut egui::Ui, l: &str, s: &mut String) {
 
 fn label(p: &mut PlotUi, x: f64, y: f64, s: impl Into<String>, c: Color32, a: Align2) {
     p.add(Text::new("", PlotPoint::new(x, y), RichText::new(s.into()).color(c)).anchor(a));
+}
+
+/// Plot label painted after the plot on a dark box, so it stays readable over the waterfall and the lines.
+struct Tag { at: PlotPoint, text: String, color: Color32, anchor: Align2 }
+
+fn tag(v: &mut Vec<Tag>, x: f64, y: f64, s: impl Into<String>, c: Color32, a: Align2) {
+    v.push(Tag { at: PlotPoint::new(x, y), text: s.into(), color: c, anchor: a });
+}
+
+fn paint_tags(ui: &egui::Ui, tr: &PlotTransform, tags: &[Tag]) {
+    let painter = ui.painter_at(*tr.frame());
+    for t in tags {
+        let g = painter.layout_no_wrap(t.text.clone(), egui::FontId::monospace(14.0), t.color);
+        let r = t.anchor.anchor_size(tr.position_from_point(&t.at), g.size());
+        painter.rect_filled(r.expand(3.0), 3.0, Color32::from_black_alpha(210));
+        painter.galley(r.min, g, t.color);
+    }
+}
+
+/// Grid steps 1, 5 and 10 times a power of ten, so a kHz axis gets a label every few hundred pixels at most.
+fn steps_1_5_10(g: GridInput) -> [f64; 3] {
+    let a = 10f64.powf(g.base_step_size.abs().max(1e-12).log10().ceil());
+    [a, 5.0 * a, 10.0 * a]
 }
 
 fn seg(p: &mut PlotUi, a: [f64; 2], b: [f64; 2], c: Color32, w: f32, dotted: bool) {
@@ -182,6 +251,7 @@ impl App {
         self.fit = None;
         self.laser = None;
         self.wf_tex = None;
+        self.run += 1;
         let (tx, rx) = channel();
         self.rx = Some(rx);
         let ctx = ctx.clone();
@@ -334,19 +404,28 @@ impl App {
     fn wf_image(&self, tex: &TextureHandle) -> PlotImage {
         let w = &self.trace.as_ref().unwrap().waterfall;
         let (f0, f1, t0, t1) = (w.f[0] / 1e3, w.f[w.f.len() - 1] / 1e3, w.t[0], w.t[w.t.len() - 1]);
-        PlotImage::new("waterfall", tex.id(), PlotPoint::new((f0 + f1) / 2.0, (t0 + t1) / 2.0), [(f1 - f0) as f32, (t1 - t0) as f32])
+        PlotImage::new("", tex.id(), PlotPoint::new((f0 + f1) / 2.0, (t0 + t1) / 2.0), [(f1 - f0) as f32, (t1 - t0) as f32])
     }
 
     fn waterfall_tab(&mut self, ui: &mut egui::Ui) {
         let Some(tex) = self.wf_texture(ui.ctx()) else { ui.label("Run a recording to see its waterfall."); return };
-        let t = self.trace.as_ref().unwrap();
-        ui.label(format!("{}   centre {:.6} MHz   (scroll to zoom, drag to pan, double-click to reset)", t.name, t.centre_hz / 1e6));
         let img = self.wf_image(&tex);
+        let t = self.trace.as_ref().unwrap();
+        ui.label(RichText::new("Waterfall: each row is one spectrum, time runs up; the bright S-shaped line is the satellite's signal").strong());
+        ui.label(format!("{}   centre {:.6} MHz   (scroll to zoom, drag to pan, double-click to reset)", t.name, t.centre_hz / 1e6));
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.show_trace, "show the measured trace (red)");
+            ui.add_space(20.0);
+            colour_bar(ui);
+        });
+        let ([x0, x1], [y0, y1]) = signal_view(t);
         let tr: Vec<[f64; 2]> = t.points.iter().map(|p| [p.f_offset / 1e3, p.t_s]).collect();
-        Plot::new("wf").x_axis_label("offset from centre (kHz)").y_axis_label("time from start of recording (s)")
-            .legend(Legend::default()).show(ui, |p| {
+        let show = self.show_trace;
+        Plot::new(("wf", self.run)).x_axis_label("frequency offset from centre (kHz)").y_axis_label("time from start of recording (s)")
+            .default_x_bounds(x0, x1).default_y_bounds(y0, y1).x_grid_spacer(uniform_grid_spacer(steps_1_5_10))
+            .legend(Legend::default().position(Corner::LeftTop)).show(ui, |p| {
                 p.add(img);
-                p.add(Points::new("measured trace", tr).color(RED).radius(1.2));
+                if show { p.add(Points::new("measured trace", tr).color(RED).radius(1.2)); }
             });
     }
 
@@ -354,45 +433,70 @@ impl App {
         let Some((r, _)) = &self.fit else { ui.label("Run a recording to see the S-curve."); return };
         let (m, [t0, v, d, f0]) = (&r.marks, r.p);
         let (th, fh) = (m.half_plateau_t_s, m.half_plateau_hz);
-        let (lo, hi) = (r.t[0].min(th[0]) - 20.0, r.t[r.t.len() - 1].max(th[1]) + 20.0);
         let k = |x: f64| (x - f0) / 1e3;
-        let yb = k(m.f_plus_hz) * 1.12 + 0.1;
+        let (ta, tb) = (r.t[0], r.t[r.t.len() - 1]);
+        let xpad = 0.03 * (tb - ta);
+        let (xlo, xhi) = (ta - t0 - xpad, tb - t0 + xpad);
+        let [fa, fb] = extent(r.f.iter().chain([&m.f_plus_hz, &m.f_minus_hz])).unwrap_or([f0 - 1.0, f0 + 1.0]);
+        let (ya, yb) = (k(fa), k(fb));
+        let yr = yb - ya;
+        let ybr = ya - 0.07 * yr;
+        let (ylo, yhi) = (ya - 0.17 * yr, yb + 0.06 * yr);
         ui.label(RichText::new("Doppler S-curve: plateaus, middle, half-plateau points and width").strong());
+        ui.label("Half-plateau points: where the curve is halfway between the middle (f₀) and a plateau. \
+            There the distance changes at half the speed. Δt between them gives d = Δt · v · √3/2.");
         ui.label(RichText::new(format!(
             "v = c (f₊ − f₋)/(f₊ + f₋) = {:.3} km/s\nd = Δt · v · √3/2 = {:.1} km\nd = f₀ v² / (c · |slope at middle|) = {:.1} km   (slope {:.1} Hz/s)\nfull fit: v {:.3} km/s, d {:.1} km, f₀ {} Hz",
             m.v_plateaus_m_s / 1e3, m.d_width_m / 1e3, m.d_slope_m / 1e3, m.slope_hz_s, v / 1e3, d / 1e3, fit::fcomma(f0, 1))).monospace());
         let h = ui.available_height() - 40.0;
-        let tt = linspace(lo, hi, 1500);
+        let tt = linspace(ta, tb, 1500);
         let curve: Vec<[f64; 2]> = tt.iter().zip(r.curve(&tt)).map(|(t, f)| [t - t0, k(f)]).collect();
         let meas: Vec<[f64; 2]> = r.t.iter().zip(&r.f).map(|(t, f)| [t - t0, k(*f)]).collect();
-        let link = Id::unique("scurve_x");
-        Plot::new("scurve").height(h * 0.72).link_axis(link, [true, false]).legend(Legend::default())
+        let link = Id::unique(("scurve_x", self.run));
+        let lx = xhi - 0.01 * (xhi - xlo);
+        let resp = Plot::new(("scurve", self.run)).height(h * 0.72).link_axis(link, [true, false])
+            .legend(Legend::default().position(Corner::LeftBottom).text_style(TextStyle::Monospace))
             .y_axis_label("received − f₀ (kHz)")
-            .default_x_bounds(lo - t0, hi - t0 + (hi - lo) * 0.18)
-            .default_y_bounds(k(m.f_minus_hz) * 1.25 - 0.1, yb + k(m.f_plus_hz).abs() * 0.15 + 0.3)
+            .default_x_bounds(xlo, xhi).default_y_bounds(ylo, yhi)
             .show(ui, |p| {
+                let mut tags = vec![];
                 p.add(Points::new("measured", meas).color(BLUE).radius(1.5));
-                p.add(Line::new("straight-pass fit", curve).color(RED).width(1.5));
-                for (f, l) in [(m.f_plus_hz, "plateau f₊ (coming)"), (m.f_minus_hz, "plateau f₋ (going)"), (f0, "middle f₀")] {
-                    p.add(HLine::new("", k(f)).color(GREY).style(LineStyle::dashed_dense()));
-                    label(p, hi - t0, k(f), format!(" {l}"), Color32::LIGHT_GRAY, Align2::LEFT_CENTER);
+                p.add(Line::new("full fit (straight pass)", curve).color(RED).width(1.5));
+                // All line labels sit at the right edge: there the curve is near f₋, below them or just above f₋'s label.
+                // The lines carry their own labels, so the legend stays short.
+                for (f, l, c, a) in [
+                    (m.f_plus_hz, "plateau f₊ = f₀/(1 − v/c)  (coming)", GREEN, Align2::RIGHT_TOP),
+                    (f0, "middle f₀", Color32::LIGHT_GRAY, Align2::RIGHT_BOTTOM),
+                    (m.f_minus_hz, "plateau f₋ = f₀/(1 + v/c)  (going)", PURPLE, Align2::RIGHT_TOP),
+                ] {
+                    p.add(HLine::new("", k(f)).color(c).style(LineStyle::dashed_dense()));
+                    tag(&mut tags, lx, k(f), l, c, a);
                 }
-                p.add(VLine::new("", 0.0).color(GREY).style(LineStyle::dotted_dense()));
-                for i in 0..2 {
-                    let (x, y) = (th[i] - t0, k(fh[i]));
-                    p.add(Points::new("", vec![[x, y]]).shape(MarkerShape::Circle).filled(false).radius(9.0).color(GOLD));
-                    let txt = format!("half-plateau {}\nrange rate {}v/2", i + 1, if i == 0 { '−' } else { '+' });
-                    label(p, x, y, txt, GOLD, if i == 0 { Align2::RIGHT_TOP } else { Align2::LEFT_BOTTOM });
-                    seg(p, [x, y], [x, yb], GOLD, 1.0, true);
+                for (f, sign) in fh.into_iter().zip(['−', '+']) {
+                    p.add(HLine::new("", k(f)).color(GOLD).style(LineStyle::dotted_dense()));
+                    tag(&mut tags, lx, k(f), format!("halfway level f₀/(1 {sign} v/2c)"), GOLD, Align2::RIGHT_BOTTOM);
                 }
-                span_arrow(p, [th[0] - t0, yb], [th[1] - t0, yb], GOLD);
-                label(p, (th[0] + th[1]) / 2.0 - t0, yb, format!("Δt = {:.2} s", m.dt_s), GOLD, Align2::CENTER_BOTTOM);
+                let pts: Vec<[f64; 2]> = (0..2).map(|i| [th[i] - t0, k(fh[i])]).collect();
+                p.add(Points::new("half-plateau points", pts.clone()).shape(MarkerShape::Circle).filled(false).radius(8.0).color(YELLOW));
+                let dx = 0.01 * (xhi - xlo);
+                for (i, &[x, y]) in pts.iter().enumerate() {
+                    seg(p, [x, y], [x, ybr], YELLOW, 1.2, true);
+                    let txt = format!("half-plateau {}\nrange rate {}v/2\nt = {:.1} s", i + 1, if i == 0 { '−' } else { '+' }, th[i]);
+                    // Below-left of each point is clear: the curve runs from upper left to lower right.
+                    tag(&mut tags, x - dx, y, txt, YELLOW, Align2::RIGHT_TOP);
+                }
+                span_arrow(p, [pts[0][0], ybr], [pts[1][0], ybr], YELLOW);
+                tag(&mut tags, (pts[0][0] + pts[1][0]) / 2.0, ybr, format!("Δt = {:.2} s", m.dt_s), YELLOW, Align2::CENTER_TOP);
+                tags
             });
+        paint_tags(ui, &resp.transform, &resp.inner);
         ui.label(format!("left over: {} path (smooth pattern {:.1} Hz rms, scatter {:.1} Hz rms, p = {})",
             r.path_word(), r.path.pattern_rms_hz, r.path.scatter_rms_hz, fit::fg(r.path.p_value, 2)));
         let left: Vec<[f64; 2]> = r.t.iter().zip(&r.left).map(|(t, l)| [t - t0, *l]).collect();
-        Plot::new("left").height(ui.available_height()).link_axis(link, [true, false])
+        let lm = extent(r.left.iter()).map_or(1.0, |[a, b]| a.abs().max(b.abs()) * 1.1);
+        Plot::new(("left", self.run)).height(ui.available_height()).link_axis(link, [true, false])
             .x_axis_label("time from closest approach (s)").y_axis_label("left over (Hz)")
+            .default_x_bounds(xlo, xhi).default_y_bounds(-lm, lm)
             .show(ui, |p| {
                 p.add(Points::new("left over", left).color(BLUE).radius(1.5));
                 p.add(HLine::new("", 0.0).color(Color32::LIGHT_GRAY));
@@ -403,35 +507,42 @@ impl App {
         let Some(tex) = self.wf_texture(ui.ctx()) else { ui.label("Run a recording to see the marked waterfall."); return };
         let Some((r, _)) = &self.fit else { ui.label("The fit did not finish."); return };
         let t = self.trace.as_ref().unwrap();
-        let (w, m, [_, v, d, f0], centre) = (&t.waterfall, &r.marks, r.p, t.centre_hz);
+        let (m, [_, v, d, f0], centre) = (&r.marks, r.p, t.centre_hz);
         let x = |f: f64| (f - centre) / 1e3;
-        let (wt0, wt1, wf0, wf1) = (w.t[0], w.t[w.t.len() - 1], w.f[0], w.f[w.f.len() - 1]);
+        let ([vx0, vx1], [wt0, wt1]) = signal_view(t);
         ui.label(RichText::new(format!("Waterfall with the half-plateau points: v {:.3} km/s, d {:.1} km", v / 1e3, d / 1e3)).strong());
+        ui.label("The fitted curve over the waterfall. The circles are the half-plateau points; Δt between them gives d = Δt · v · √3/2.");
         let ty = linspace(wt0, wt1, 1500);
         let curve: Vec<[f64; 2]> = ty.iter().zip(r.curve(&ty)).map(|(t, f)| [x(f), *t]).collect();
         let img = self.wf_image(&tex);
-        let xb = wf1 / 1e3 * 0.85;
-        Plot::new("marked").x_axis_label("offset from centre (kHz)").y_axis_label("time from start of recording (s)")
-            .legend(Legend::default()).show(ui, |p| {
+        let w = vx1 - vx0;
+        let xb = vx1 - 0.06 * w;
+        let resp = Plot::new(("marked", self.run)).x_axis_label("frequency offset from centre (kHz)").y_axis_label("time from start of recording (s)")
+            .default_x_bounds(vx0, vx1).default_y_bounds(wt0, wt1).x_grid_spacer(uniform_grid_spacer(steps_1_5_10))
+            .legend(Legend::default().position(Corner::LeftTop)).show(ui, |p| {
+                let mut tags = vec![];
                 p.add(img);
-                p.add(Line::new("straight-pass fit", curve).color(Color32::from_rgba_unmultiplied(255, 90, 90, 204)).width(1.0));
+                p.add(Line::new("full fit (straight pass)", curve).color(Color32::from_rgba_unmultiplied(120, 200, 255, 220)).width(1.5));
                 for (f, l) in [(m.f_plus_hz, "f₊"), (m.f_minus_hz, "f₋"), (f0, "f₀")] {
-                    if wf0 < f - centre && f - centre < wf1 {
+                    if vx0 < x(f) && x(f) < vx1 {
                         p.add(VLine::new("", x(f)).color(Color32::WHITE).style(LineStyle::dashed_dense()));
-                        label(p, x(f) + 0.15, wt0 + 0.02 * (wt1 - wt0), l, Color32::WHITE, Align2::LEFT_BOTTOM);
+                        tag(&mut tags, x(f), wt0 + 0.01 * (wt1 - wt0), l, Color32::WHITE, Align2::CENTER_BOTTOM);
                     }
                 }
                 for i in 0..2 {
                     let (fx, ty) = (x(m.half_plateau_hz[i]), m.half_plateau_t_s[i]);
-                    p.add(Points::new("", vec![[fx, ty]]).shape(MarkerShape::Circle).filled(false).radius(10.0).color(YELLOW));
-                    label(p, fx + if i == 1 { 0.6 } else { -0.6 }, ty, format!("half-plateau {}", i + 1), YELLOW,
-                        if i == 1 { Align2::LEFT_CENTER } else { Align2::RIGHT_CENTER });
+                    p.add(Points::new("half-plateau points", vec![[fx, ty]]).shape(MarkerShape::Circle).filled(false).radius(10.0).color(YELLOW));
+                    // Time runs up and frequency falls, so the curve never passes below-left or above-right of a point.
+                    let txt = format!("half-plateau {}  ({:.1} s)", i + 1, ty);
+                    if i == 0 { tag(&mut tags, fx - 0.02 * w, ty, txt, YELLOW, Align2::RIGHT_TOP) } else { tag(&mut tags, fx + 0.02 * w, ty, txt, YELLOW, Align2::LEFT_BOTTOM) }
                     seg(p, [fx, ty], [xb, ty], YELLOW, 1.0, true);
                 }
                 let th = m.half_plateau_t_s;
                 span_arrow(p, [xb, th[0]], [xb, th[1]], YELLOW);
-                label(p, xb - 0.3, (th[0] + th[1]) / 2.0, format!("Δt = {:.2} s", m.dt_s), YELLOW, Align2::RIGHT_CENTER);
+                tag(&mut tags, xb - 0.01 * w, (th[0] + th[1]) / 2.0, format!("Δt = {:.2} s", m.dt_s), YELLOW, Align2::RIGHT_CENTER);
+                tags
             });
+        paint_tags(ui, &resp.transform, &resp.inner);
     }
 
     fn laser_tab(&mut self, ui: &mut egui::Ui) {
@@ -451,7 +562,7 @@ impl App {
         let (tk, rk, along) = crate::triangle(p, f);
         let h = ui.available_height() - 20.0;
         let link = Id::unique("laser_x");
-        Plot::new("range").height(h * 0.6).link_axis(link, [true, false]).legend(Legend::default())
+        Plot::new(("range", self.run)).height(h * 0.6).link_axis(link, [true, false]).legend(Legend::default())
             .y_axis_label("distance to the satellite (km)").show(ui, |pl| {
                 pl.add(Points::new("measured: round-trip time × c/2", t.iter().zip(&p.r).map(|(t, r)| [*t, *r]).collect::<Vec<_>>()).color(BLUE).radius(2.5));
                 pl.add(Line::new("straight path: r² = d² + (v·t)²", tt.iter().map(|&x| [x, d.hypot(v * x)]).collect::<Vec<_>>()).color(RED).width(1.5));
@@ -464,16 +575,151 @@ impl App {
                     tk.abs(), along / tk.abs()), GOLD, if tk > 0.0 { Align2::RIGHT_CENTER } else { Align2::LEFT_CENTER });
             });
         let sp: Vec<[f64; 2]> = slr::speeds(p, f).into_iter().map(|(t, s)| [t, s]).collect();
-        Plot::new("speeds").height(ui.available_height()).link_axis(link, [true, false]).legend(Legend::default())
+        Plot::new(("speeds", self.run)).height(ui.available_height()).link_axis(link, [true, false]).legend(Legend::default())
             .x_axis_label("time from closest approach (s)").y_axis_label("speed (km/s)").show(ui, |pl| {
                 pl.add(Points::new("v = √(r² − d²) / |t|, each shot", sp).color(BLUE).radius(2.5));
                 pl.add(HLine::new(format!("fit {v:.4} km/s"), v).color(RED).width(1.5));
             });
     }
+
+    fn math_tab(&self, ui: &mut egui::Ui) {
+        let h = |ui: &mut egui::Ui, s: &str| { ui.add_space(14.0); ui.label(RichText::new(s).size(19.0).strong()); ui.add_space(2.0); };
+        let p = |ui: &mut egui::Ui, s: &str| { ui.label(RichText::new(s).size(15.0).color(Color32::from_gray(215))); };
+        let eq = |ui: &mut egui::Ui, s: &str| { ui.label(RichText::new(format!("    {s}")).monospace().size(15.0).color(Color32::from_rgb(0xe8, 0xec, 0xf2))); };
+        let here = |ui: &mut egui::Ui, s: Option<String>| if let Some(s) = s { ui.label(RichText::new(format!("        here: {s}")).monospace().size(14.0).color(GOLD)); };
+        let fit = self.fit.as_ref().map(|f| &f.0);
+        let km = fit.is_none_or(|r| r.c > 1e5);
+        let len = |x: f64| if km { format!("{} km", fit::fcomma(x / 1e3, 1)) } else { format!("{} m", fit::fcomma(x, 1)) };
+        let spd = |x: f64| if km { format!("{} km/s", fit::fx(x / 1e3, 4)) } else { format!("{} m/s", fit::fx(x, 3)) };
+        let hz = |x: f64| format!("{} Hz", fit::fcomma(x, 1));
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            ui.set_max_width(ui.available_width().min(980.0));
+            ui.label(RichText::new("How the kit gets speed and distance").size(22.0).strong());
+            p(ui, "Gold lines show the numbers of the current run. Each formula comes first, then the numbers filled in.");
+
+            h(ui, "The picture");
+            p(ui, "A source moves in a straight line at a constant speed v. At time t₀ it is closest to you, at distance d. \
+                It sends a wave at frequency f₀. The wave moves at speed c. The kit finds v, d, t₀ and f₀ from the received frequency alone.");
+            here(ui, fit.map(|r| format!("c = {} m/s", fit::fcomma(r.c, 0))));
+
+            h(ui, "The received frequency");
+            p(ui, "Let τ be the time when the wave left the source, counted from closest approach.");
+            eq(ui, "distance:    r(τ) = √(d² + v² τ²)");
+            eq(ui, "range rate:  r' = v² τ / √(d² + v² τ²)");
+            p(ui, "The wave arrives later than it left, by the travel time r/c. The kit gets τ from the receive time t by putting the answer back in, 6 times:");
+            eq(ui, "τ = (t − t₀) − (√(d² + v² τ²) − d) / c");
+            p(ui, "The received frequency is:");
+            eq(ui, "f(t) = f₀ / (1 + r'/c)");
+            eq(ui, "f(t) = f₀ / (1 + v² τ / (c √(d² + v² τ²)))");
+            here(ui, fit.map(|r| format!("f₀ = {}, v = {}, d = {}, t₀ = {:.2} s from the start", hz(r.p[3]), spd(r.p[1]), len(r.p[2]), r.p[0])));
+
+            h(ui, "The plateaus give the speed");
+            p(ui, "Long before closest approach, τ is large and negative, so r' is close to −v. Long after, r' is close to +v.");
+            eq(ui, "coming:  f₊ = f₀ / (1 − v/c)");
+            eq(ui, "going:   f₋ = f₀ / (1 + v/c)");
+            here(ui, fit.map(|r| format!("f₊ = {}, f₋ = {}", hz(r.marks.f_plus_hz), hz(r.marks.f_minus_hz))));
+            p(ui, "Solve the two lines for v and f₀:");
+            eq(ui, "v = c (f₊ − f₋) / (f₊ + f₋)");
+            here(ui, fit.map(|r| format!("v = {}", spd(r.marks.v_plateaus_m_s))));
+            eq(ui, "f₀ = 2 f₊ f₋ / (f₊ + f₋)");
+            here(ui, fit.map(|r| format!("f₀ = {}", hz(2.0 * r.marks.f_plus_hz * r.marks.f_minus_hz / (r.marks.f_plus_hz + r.marks.f_minus_hz)))));
+            p(ui, "These use the plateaus of the fitted curve. The kit also reads the plateaus from the raw ends of the trace \
+                (the first and the last 2 % of the points). A pass cut short by the horizon never reaches its plateaus, \
+                so this raw estimate alone reads v and d low.");
+            here(ui, fit.map(|r| format!("raw ends: v = {}, f₀ = {}, d = {}", spd(r.a.v), hz(r.a.f0), len(r.a.d))));
+
+            h(ui, "The half-plateau points give the distance");
+            p(ui, "A half-plateau point is where the distance changes at half the speed. Step by step:");
+            eq(ui, "1.  r' = v² τ / √(d² + v² τ²)");
+            eq(ui, "2.  set r' = −v/2 (coming) or r' = +v/2 (going)");
+            eq(ui, "3.  the frequency there:  f = f₀ / (1 ∓ v/2c)");
+            here(ui, fit.map(|r| format!("f = {} and {}", hz(r.marks.half_plateau_hz[0]), hz(r.marks.half_plateau_hz[1]))));
+            eq(ui, "4.  v² τ / √(d² + v² τ²) = ±v/2");
+            eq(ui, "5.  2 v τ = ±√(d² + v² τ²)");
+            eq(ui, "6.  4 v² τ² = d² + v² τ²");
+            eq(ui, "7.  3 v² τ² = d²");
+            eq(ui, "8.  τ = ±d / (v √3)");
+            p(ui, "The two points are this far apart in time:");
+            eq(ui, "9.  Δt = 2 d / (v √3)");
+            here(ui, fit.map(|r| format!("points at {:.2} s and {:.2} s, Δt = {:.2} s", r.marks.half_plateau_t_s[0], r.marks.half_plateau_t_s[1], r.marks.dt_s)));
+            p(ui, "Turn it around:");
+            eq(ui, "10. d = Δt · v · √3/2");
+            here(ui, fit.map(|r| format!("d = {:.2} s × {} × √3/2 = {}", r.marks.dt_s, spd(r.p[1]), len(r.marks.d_width_m))));
+
+            h(ui, "The slope at the middle gives the distance again");
+            p(ui, "At closest approach τ = 0. Near there r' is close to v² τ / d, so the curve falls in a straight line:");
+            eq(ui, "df/dt = −f₀ v² / (c d)");
+            eq(ui, "d = f₀ v² / (c |df/dt|)");
+            here(ui, fit.map(|r| format!("slope = {:.2} Hz/s, d = {}", r.marks.slope_hz_s, len(r.marks.d_slope_m))));
+
+            h(ui, "The full fit");
+            p(ui, "The kit changes t₀, v, d and f₀ until the curve f(t) passes as close as it can to all the measured points. \
+                Close means the smallest sum of squares. It starts from the plateau and half-plateau values. \
+                When you give f₀, f₀ stays fixed and only t₀, v and d change. This is the result to use.");
+            eq(ui, "S = Σ (f_i − f(t_i))²     (as small as possible; i runs over the points)");
+            eq(ui, "rms = √(S / n)");
+            here(ui, fit.map(|r| format!("n = {} points, rms = {:.1} Hz", r.d.n, r.d.rms_hz)));
+            here(ui, fit.map(|r| format!("v = {} ± {}, d = {} ± {}", spd(r.d.v_m_s), spd(r.err("v_m_s")), len(r.d.d_m), len(r.err("d_m")))));
+            p(ui, "Errors: the points are 0.25 s apart, but each one comes from a 1 s window. So only every k-th point is independent. \
+                The kit allows for this: each error is √k times larger than with all points counted.");
+            eq(ui, "error² = k · rms² · (the matching diagonal entry of (J^T J)⁻¹)");
+            p(ui, "J is the table of how each point's f(t) changes when one value changes.");
+            here(ui, fit.map(|r| format!("k = {}", fit::fg(r.indep, 3))));
+
+            h(ui, "Straight or bending path");
+            p(ui, "What the fit leaves over at each point:");
+            eq(ui, "e_i = f_i − f(t_i)");
+            p(ui, "A straight path leaves scatter around zero. A bending path leaves a smooth wave. \
+                The kit puts a polynomial of degree 6 through the leftover. Then an F-test compares the smooth part with the scatter, \
+                counting only the independent points.");
+            eq(ui, "n_eff = n / k");
+            eq(ui, "F = ((RSS₀ − RSS₁) / 7) / (RSS₁ / (n_eff − 7))");
+            p(ui, "RSS₀ is the sum of squares of the leftover. RSS₁ is the same after the polynomial is taken away. \
+                p is the chance of an F this large from scatter alone.");
+            eq(ui, "p below 0.001  →  bending.   Otherwise straight.");
+            here(ui, fit.map(|r| format!("smooth pattern {:.1} Hz rms, scatter {:.1} Hz rms, p = {}: {}",
+                r.path.pattern_rms_hz, r.path.scatter_rms_hz, fit::fg(r.path.p_value, 2), r.path_word())));
+
+            h(ui, "How the trace is measured");
+            p(ui, "1.  Lower the sample rate to about 48,000 samples a second. Remove the receiver's DC line.");
+            p(ui, "2.  Find the signal: 0.25 s spectra, every bin and every frame divided by its median, fixed receiver lines masked, \
+                the strongest 300 Hz band in each frame. A smooth S-shaped curve through it steers the next steps only.");
+            p(ui, "3.  Measure: multiply the recording by the opposite phase of that curve (dechirp), so the carrier sits near 0 Hz. \
+                Then 1.0 s Hann windows every 0.25 s on a 1 Hz grid, searching ±400 Hz, then ±100 Hz, then ±150 Hz, \
+                each time with a better reference. The value is the noise-subtracted power centroid in the band.");
+            p(ui, "4.  Keep a point when its peak is more than 14 dB above the frame median, it is not on a fixed receiver line, \
+                and it lies within 4 sigma of a smoothing spline. Sigma (the point noise) comes from second differences.");
+            here(ui, self.trace.as_ref().map(|t| format!("{} points, point noise {:.1} Hz, swing {}", t.points.len(), t.point_noise_hz, hz(t.swing_hz))));
+            p(ui, "The waterfall picture: 0.1 s spectra every 0.5 s with 10 Hz bins, each bin in dB above the medians of its column and row.");
+
+            h(ui, "Laser ranging");
+            p(ui, "A laser station fires a short pulse at the satellite and times the return. Each shot gives a distance:");
+            eq(ui, "r = round-trip time × c / 2");
+            p(ui, "A satellite that flies straight past the station at speed v, closest distance d at time t₀, is at \
+                (Pythagoras, t counted from closest approach):");
+            eq(ui, "r² = d² + (v · t)²");
+            p(ui, "So every shot gives the speed on its own:");
+            eq(ui, "v = √(r² − d²) / |t|");
+            p(ui, "The kit fits d, v and t₀ to all shots within ±3 minutes of the closest one.");
+            let which = self.which.trim().parse::<usize>().unwrap_or(0);
+            if let Some((ps, f)) = self.laser.as_ref().and_then(|(run, _)| run.passes.get(which)) {
+                let (tk, rk, along) = crate::triangle(ps, f);
+                here(ui, Some(format!("pass {which}: d = {:.1} km, v = {:.4} km/s", f.d_km, f.v_km_s)));
+                here(ui, Some(format!("one shot at t = {tk:+.1} s: r = {rk:.1} km")));
+                here(ui, Some(format!("√(r² − d²) = √({rk:.1}² − {:.1}²) = {along:.1} km", f.d_km)));
+                here(ui, Some(format!("v = {along:.1} / {:.1} = {:.4} km/s", tk.abs(), along / tk.abs())));
+            }
+            ui.add_space(20.0);
+        });
+    }
 }
 
 impl eframe::App for App {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) { self.draw(ui); }
+}
+
+impl App {
+    fn draw(&mut self, ui: &mut egui::Ui) {
         self.poll();
         if let Some(rx) = &self.picker {
             match rx.try_recv() {
@@ -481,6 +727,8 @@ impl eframe::App for App {
                 Ok((false, p)) => {
                     if let Some(c) = p.file_name().and_then(|n| centre_from_name(&n.to_string_lossy())) { self.centre = c; }
                     self.file = p.display().to_string();
+                    self.start.clear();
+                    self.span = "15000".into();
                     self.picker = None;
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => self.picker = None,
@@ -493,7 +741,7 @@ impl eframe::App for App {
         });
         egui::CentralPanel::default_margins().show(ui, |ui| {
             ui.horizontal(|ui| {
-                for (t, l) in [(Tab::Results, "Results"), (Tab::Waterfall, "Waterfall"), (Tab::SCurve, "S-curve"), (Tab::Marked, "Marked waterfall"), (Tab::Laser, "Laser")] {
+                for (t, l) in [(Tab::Results, "Results"), (Tab::Waterfall, "Waterfall"), (Tab::SCurve, "S-curve"), (Tab::Marked, "Marked waterfall"), (Tab::Laser, "Laser"), (Tab::Math, "Math")] {
                     ui.selectable_value(&mut self.tab, t, l);
                 }
             });
@@ -508,6 +756,7 @@ impl eframe::App for App {
                 Tab::SCurve => self.scurve_tab(ui),
                 Tab::Marked => self.marked_tab(ui),
                 Tab::Laser => self.laser_tab(ui),
+                Tab::Math => self.math_tab(ui),
             }
         });
     }
@@ -521,10 +770,96 @@ mod tests {
     fn name_centre_and_waterfall_image() {
         assert_eq!(centre_from_name("x_12Hz_437800000Hz_IQ").as_deref(), Some("437800000"));
         assert_eq!(centre_from_name("rec_1000Hz"), None);
-        let w = trace::Waterfall { t: vec![0.0, 0.5, 1.0], f: (0..5).map(|j| j as f64).collect(), db: (0..15).map(|v| v as f32).collect() };
+        let mut db = vec![0.0f32; 15];
+        db[2 * 5 + 4] = 12.5;
+        let w = trace::Waterfall { t: vec![0.0, 0.5, 1.0], f: (0..5).map(|j| j as f64).collect(), db };
         let im = waterfall_image(&w, 2);
         assert_eq!(im.size, [2, 2]);
-        assert_eq!(im.pixels[1], viridis(14.0 / 15.0));
-        assert_eq!(im.pixels[2], viridis(7.0 / 15.0));
+        assert_eq!(im.pixels[1], inferno((10.0 * 10f32.powf(1.25).log10() - WF_DB[0]) / (WF_DB[1] - WF_DB[0])));
+        assert_eq!(im.pixels[1], Color32::from_rgb(186, 54, 85));
+        assert_eq!(im.pixels[0], inferno(0.0));
+        assert_eq!(inferno(0.0), Color32::from_rgb(0, 0, 4));
+    }
+
+    fn block_on<F: std::future::Future>(f: F) -> F::Output {
+        let mut f = std::pin::pin!(f);
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        loop {
+            if let std::task::Poll::Ready(v) = f.as_mut().poll(&mut cx) { return v; }
+            std::thread::yield_now();
+        }
+    }
+
+    /// Draws every tab off screen (no window) and writes one PPM per tab.
+    /// DK_SHOT_INPUT=file [DK_SHOT_CENTER=Hz] DK_SHOT_OUT=dir/prefix cargo test --release render_tabs -- --ignored
+    #[test]
+    #[ignore]
+    fn render_tabs_offscreen() {
+        use eframe::egui_wgpu::{wgpu, Renderer, RendererOptions, ScreenDescriptor};
+        let input = std::env::var("DK_SHOT_INPUT").expect("DK_SHOT_INPUT");
+        let out = std::env::var("DK_SHOT_OUT").expect("DK_SHOT_OUT");
+        let (w, h) = (1400u32, std::env::var("DK_SHOT_H").ok().and_then(|v| v.parse().ok()).unwrap_or(900u32));
+        let ctx = egui::Context::default();
+        ctx.set_theme(egui::Theme::Dark);
+        let mut app = App { file: input, centre: std::env::var("DK_SHOT_CENTER").unwrap_or_default(), ..App::default() };
+        app.start(&ctx);
+        while app.rx.is_some() { app.poll(); std::thread::sleep(std::time::Duration::from_millis(50)); }
+        print!("{}", app.log);
+        app.show_trace = std::env::var("DK_SHOT_NOTRACE").is_err();
+        let inst = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let adapter = block_on(inst.request_adapter(&wgpu::RequestAdapterOptions::default())).unwrap();
+        let (dev, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).unwrap();
+        let fmt = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let mut rend = Renderer::new(&dev, fmt, RendererOptions::default());
+        let tex = dev.create_texture(&wgpu::TextureDescriptor {
+            label: None, size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 }, mip_level_count: 1, sample_count: 1,
+            dimension: wgpu::TextureDimension::D2, format: fmt, usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC, view_formats: &[],
+        });
+        let view = tex.create_view(&Default::default());
+        let row = (w * 4).div_ceil(256) * 256;
+        let buf = dev.create_buffer(&wgpu::BufferDescriptor { label: None, size: (row * h) as u64, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
+        let sd = ScreenDescriptor { size_in_pixels: [w, h], pixels_per_point: 1.0 };
+        let tabs = [(Tab::Results, "results"), (Tab::Waterfall, "waterfall"), (Tab::SCurve, "scurve"), (Tab::Marked, "marked"), (Tab::Laser, "laser"), (Tab::Math, "math")];
+        for (tab, name) in tabs {
+            app.tab = tab;
+            let mut prims = vec![];
+            for _ in 0..4 {
+                let raw = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(w as f32, h as f32))),
+                    max_texture_side: Some(8192), ..Default::default()
+                };
+                let o = ctx.run_ui(raw, |ui| app.draw(ui));
+                for (id, ds) in &o.textures_delta.set { ds.iter().for_each(|d| rend.update_texture(&dev, &queue, *id, d)); }
+                prims = ctx.tessellate(o.shapes, o.pixels_per_point);
+                for id in &o.textures_delta.free { rend.free_texture(id); }
+            }
+            let mut enc = dev.create_command_encoder(&Default::default());
+            let cmds = rend.update_buffers(&dev, &queue, &mut enc, &prims, &sd);
+            {
+                let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view, depth_slice: None, resolve_target: None,
+                        ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
+                    })],
+                    ..Default::default()
+                }).forget_lifetime();
+                rend.render(&mut rp, &prims, &sd);
+            }
+            enc.copy_texture_to_buffer(tex.as_image_copy(), wgpu::TexelCopyBufferInfo {
+                buffer: &buf, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(row), rows_per_image: Some(h) },
+            }, wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 });
+            queue.submit(cmds.into_iter().chain([enc.finish()]));
+            buf.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+            dev.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+            let mut ppm = format!("P6\n{w} {h}\n255\n").into_bytes();
+            {
+                let data = buf.slice(..).get_mapped_range().unwrap();
+                for y in 0..h as usize {
+                    for x in 0..w as usize { ppm.extend_from_slice(&data[y * row as usize + x * 4..][..3]); }
+                }
+            }
+            buf.unmap();
+            std::fs::write(format!("{out}_{name}.ppm"), ppm).unwrap();
+        }
     }
 }
