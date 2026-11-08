@@ -48,7 +48,7 @@ struct Job { path: String, opts: trace::TraceOpts, c: f64, f0: Option<f64> }
 
 struct App {
     file: String, centre: String, start: String, wave: Wave, c_other: String, f0: String, span: String,
-    rate: String, fmt: RawFormat, swap: bool, band_lo: String, band_hi: String, burst: bool, which: String, out: String,
+    rate: String, fmt: Option<RawFormat>, swap: bool, band_lo: String, band_hi: String, burst: bool, which: String, out: String,
     log: String, results: String, tab: Tab, rx: Option<Receiver<Msg>>,
     trace: Option<trace::TraceResult>, fit: Option<(fit::FitResult, PathBuf)>, laser: Option<(slr::SlrRun, String)>,
     wf_tex: Option<TextureHandle>,
@@ -62,24 +62,11 @@ impl Default for App {
     fn default() -> Self {
         App {
             file: String::new(), centre: String::new(), start: String::new(), wave: Wave::Radio, c_other: String::new(),
-            f0: String::new(), span: "15000".into(), rate: String::new(), fmt: RawFormat::Cs16, swap: false, band_lo: String::new(), band_hi: String::new(), burst: false, which: "0".into(),
+            f0: String::new(), span: String::new(), rate: String::new(), fmt: None, swap: false, band_lo: String::new(), band_hi: String::new(), burst: false, which: "0".into(),
             out: String::new(), log: String::new(), results: String::new(), tab: Tab::Results, rx: None,
             trace: None, fit: None, laser: None, wf_tex: None, run: 0, show_trace: true, picker: None,
         }
     }
-}
-
-/// First (\d{6,})Hz in a file name, as in doppler_gui.pick.
-fn centre_from_name(name: &str) -> Option<String> {
-    let b = name.as_bytes();
-    let mut i = 0;
-    while let Some(p) = name[i..].find("Hz").map(|p| p + i) {
-        let mut s = p;
-        while s > 0 && b[s - 1].is_ascii_digit() { s -= 1; }
-        if p - s >= 6 { return Some(name[s..p].to_string()); }
-        i = p + 2;
-    }
-    None
 }
 
 fn work(job: Job, tx: &Sender<Msg>, ctx: &egui::Context) -> Result<(), String> {
@@ -171,9 +158,119 @@ fn linspace(a: f64, b: f64, n: usize) -> Vec<f64> {
 }
 
 fn field(ui: &mut egui::Ui, l: &str, s: &mut String) {
+    field_auto(ui, l, s, None);
+}
+
+/// A text field; when it is empty and the last run worked the value out, the value shows as the hint text.
+fn field_auto(ui: &mut egui::Ui, l: &str, s: &mut String, auto: Option<&str>) {
     ui.label(l);
-    ui.add(egui::TextEdit::singleline(s).desired_width(250.0));
+    let mut te = egui::TextEdit::singleline(s).desired_width(250.0);
+    if let Some(a) = auto {
+        te = te.hint_text(format!("auto: {a}"));
+    }
+    let r = ui.add(te);
+    if let Some(a) = auto {
+        r.on_hover_text(format!("auto: {a}"));
+    }
     ui.end_row();
+}
+
+/// The half-plateau triangle: path, observer, closest distance d, both half-plateau points with their lines of sight,
+/// the 60° and 30° angles, the v/2 range rate and v · Δt = 2d/√3, with the numbers of the current run when there is one.
+fn half_plateau_diagram(ui: &mut egui::Ui, fit: Option<&fit::FitResult>) {
+    use egui::{pos2, vec2, FontId, Pos2, Shape, Stroke};
+    const LOS: Color32 = Color32::from_rgb(0xf6, 0xc3, 0x4a);
+    const DBLUE: Color32 = Color32::from_rgb(0x7f, 0xb2, 0xf0);
+    const ORANGE: Color32 = Color32::from_rgb(0xe9, 0x7b, 0x5a);
+    const VGREEN: Color32 = Color32::from_rgb(0x8f, 0xd8, 0x84);
+    let txt = Color32::from_gray(225);
+    let km = fit.is_none_or(|r| r.c > 1e5);
+    let len = |x: f64| if km { format!("{} km", fit::fcomma(x / 1e3, 1)) } else { format!("{} m", fit::fcomma(x, 1)) };
+    let spd = |x: f64| if km { format!("{} km/s", fit::fx(x / 1e3, 4)) } else { format!("{} m/s", fit::fx(x, 3)) };
+    let num = |sym: &str, v: Option<f64>| v.map_or(sym.to_string(), |x| format!("{sym} = {}", len(x)));
+    let dd = fit.map(|r| r.marks.d_width_m);
+    let w = ui.available_width().min(980.0);
+    let dp = (0.35 * w).min(420.0);
+    let hx = dp / 3f32.sqrt();
+    let (rect, _) = ui.allocate_exact_size(vec2(w, dp + 160.0), egui::Sense::hover());
+    let p = ui.painter_at(rect);
+    let cx = rect.left() + 0.42 * w;
+    let py = rect.top() + 110.0;
+    let o = pos2(cx, py + dp);
+    let (p1, p2, c) = (pos2(cx - hx, py), pos2(cx + hx, py), pos2(cx, py));
+    let font = FontId::proportional(14.0);
+    let t = |at: Pos2, a: Align2, s: &str, col: Color32| { p.text(at, a, s, font.clone(), col); };
+    // arrow with a fixed head (egui's head grows with the length)
+    let arrow = |a: Pos2, v: egui::Vec2, st: Stroke| {
+        let b = a + v;
+        p.line_segment([a, b], st);
+        let u = v.normalized();
+        for s in [-1.0f32, 1.0] {
+            let (sn, cs) = (s * 25f32.to_radians()).sin_cos();
+            let back = -vec2(u.x * cs - u.y * sn, u.x * sn + u.y * cs) * 10.0;
+            p.line_segment([b, b + back], st);
+        }
+    };
+    let arc = |ctr: Pos2, r: f32, a0: f32, a1: f32| {
+        let pts: Vec<Pos2> = (0..=24).map(|i| { let a = (a0 + (a1 - a0) * i as f32 / 24.0).to_radians(); ctr + vec2(a.cos(), a.sin()) * r }).collect();
+        p.add(Shape::line(pts, Stroke::new(1.2, txt)));
+    };
+    // the path, with its direction
+    let x0 = rect.left() + 10.0;
+    arrow(pos2(x0, py), vec2(cx + 2.1 * hx - x0, 0.0), Stroke::new(1.5, GREY));
+    t(pos2(x0, py - 10.0), Align2::LEFT_BOTTOM, "straight path of the source, speed v", GREY);
+    // d and the right angle
+    p.line_segment([c, o], Stroke::new(2.0, DBLUE));
+    p.add(Shape::line(vec![pos2(cx, py + 12.0), pos2(cx + 12.0, py + 12.0), pos2(cx + 12.0, py)], Stroke::new(1.2, DBLUE)));
+    t(pos2(cx - 8.0, py + 0.12 * dp), Align2::RIGHT_TOP, &format!("d (closest distance)\n{}", dd.map_or(String::new(), |x| format!("= {}", len(x)))), DBLUE);
+    // lines of sight
+    for q in [p1, p2] {
+        p.line_segment([q, o], Stroke::new(2.5, LOS));
+    }
+    t(pos2(cx + 0.4 * hx + 14.0, py + 0.6 * dp), Align2::LEFT_TOP, &format!("line of sight\n{}", num("r = 2d/√3", dd.map(|x| 2.0 * x / 3f64.sqrt()))), LOS);
+    // d/√3 along the path
+    p.line_segment([c, p2], Stroke::new(4.0, ORANGE));
+    t(pos2(cx + 0.5 * hx, py - 10.0), Align2::CENTER_BOTTOM, &num("d/√3", dd.map(|x| x / 3f64.sqrt())), ORANGE);
+    // v at half-plateau 2 and its v/2 part along the line of sight
+    let vl = 0.6 * hx;
+    arrow(p2, vec2(vl, 0.0), Stroke::new(3.0, VGREEN));
+    t(p2 + vec2(vl + 8.0, 0.0), Align2::LEFT_CENTER, "v", VGREEN);
+    let u = (p2 - o).normalized();
+    let tip = p2 + u * (vl / 2.0);
+    p.extend(Shape::dashed_line(&[p2, tip], Stroke::new(2.5, VGREEN), 6.0, 4.0));
+    arrow(tip - u * 6.0, u * 6.0, Stroke::new(2.5, VGREEN));
+    t(tip + vec2(8.0, -4.0), Align2::LEFT_BOTTOM, "v/2 along the line of sight\n(range rate +v/2)", VGREEN);
+    // angles: 60° at half-plateau 2 between the path and the line of sight, 30° at the observer
+    arc(p2, 0.18 * hx + 18.0, 120.0, 180.0);
+    t(p2 + vec2(-(0.18 * hx + 30.0) * 0.866, (0.18 * hx + 30.0) * 0.5), Align2::RIGHT_TOP, "60°", txt);
+    arc(o, 0.3 * dp, -90.0, -60.0);
+    t(o + vec2(0.3 * dp * 0.26 + 6.0, -0.3 * dp - 6.0), Align2::LEFT_BOTTOM, "30°", txt);
+    // the points and the observer
+    for (q, l, off, a) in [(p1, "half-plateau 1", vec2(0.0, -30.0), Align2::CENTER_BOTTOM), (p2, "half-plateau 2", vec2(-8.0, -30.0), Align2::RIGHT_BOTTOM)] {
+        p.circle_filled(q, 6.5, LOS);
+        t(q + off, a, l, LOS);
+    }
+    p.circle_filled(o, 5.0, Color32::from_gray(235));
+    t(o + vec2(0.0, 10.0), Align2::CENTER_TOP, "observer", txt);
+    // v · Δt between the points
+    let yb = py - 78.0;
+    arrow(pos2(cx, yb), vec2(hx, 0.0), Stroke::new(1.3, txt));
+    arrow(pos2(cx, yb), vec2(-hx, 0.0), Stroke::new(1.3, txt));
+    t(pos2(cx, yb - 4.0), Align2::CENTER_BOTTOM, &num("v · Δt = 2d/√3", dd.map(|x| 2.0 * x / 3f64.sqrt())), txt);
+    // the reasoning, below
+    let mut lines = vec![
+        "At a half-plateau point the line of sight meets the path at 60°, so the speed along it is v·cos 60° = v/2.".to_string(),
+        "tan 60° = d / (distance along the path), so distance along the path = d/√3.".into(),
+        "The two points are 2d/√3 apart and the source covers that in Δt: v·Δt = 2d/√3, so d = Δt · v · √3/2.".into(),
+        "Half-plateau 1 is the mirror image before the pass (range rate −v/2).".into(),
+    ];
+    if let Some(r) = fit {
+        lines.push(format!("This run: Δt = {:.2} s, v = {}, so d = Δt × v × 0.8660 = {:.2} × {} × 0.8660 = {}",
+            r.marks.dt_s, spd(r.p[1]), r.marks.dt_s, spd(r.p[1]), len(r.marks.d_width_m)));
+    }
+    for l in lines {
+        ui.label(RichText::new(l).monospace().size(13.5).color(Color32::from_gray(215)));
+    }
 }
 
 fn label(p: &mut PlotUi, x: f64, y: f64, s: impl Into<String>, c: Color32, a: Align2) {
@@ -254,7 +351,7 @@ impl App {
         };
         let out = Some(self.out.trim()).filter(|s| !s.is_empty()).map(PathBuf::from);
         let start = Some(self.start.trim().to_string()).filter(|s| !s.is_empty());
-        let opts = trace::TraceOpts { center, start, span: span.unwrap_or(15000.0), rate, format: self.fmt, swap_iq: self.swap, out, band, burst: self.burst };
+        let opts = trace::TraceOpts { center, start, span, rate, format: self.fmt, swap_iq: self.swap, out, band, burst: self.burst };
         self.trace = None;
         self.fit = None;
         self.laser = None;
@@ -341,7 +438,14 @@ impl App {
         });
     }
 
+    /// Auto value of the last run for a field key (centre, start, rate, format, span, band, burst).
+    fn auto_of(&self, k: &str) -> Option<String> {
+        self.trace.as_ref()?.auto.iter().find(|(a, _)| a == k).map(|(_, v)| v.clone())
+    }
+
     fn controls(&mut self, ui: &mut egui::Ui) {
+        let au: Vec<Option<String>> = ["centre", "start", "span", "rate", "format", "band", "burst"].iter().map(|k| self.auto_of(k)).collect();
+        let small = |ui: &mut egui::Ui, a: &Option<String>| if let Some(a) = a { ui.label(RichText::new(format!("auto: {a}")).small().color(GREY)); };
         egui::Grid::new("controls").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
             ui.label("Recording");
             ui.horizontal(|ui| {
@@ -351,8 +455,8 @@ impl App {
                 }
             });
             ui.end_row();
-            field(ui, "Centre / dial frequency (Hz)", &mut self.centre);
-            field(ui, "Start time UTC (optional)", &mut self.start);
+            field_auto(ui, "Centre / dial frequency (Hz)", &mut self.centre, au[0].as_deref());
+            field_auto(ui, "Start time UTC (optional)", &mut self.start, au[1].as_deref());
             ui.label("Wave");
             ui.vertical(|ui| {
                 ui.radio_value(&mut self.wave, Wave::Radio, "radio / light (299,792,458 m/s)");
@@ -362,22 +466,30 @@ impl App {
             ui.end_row();
             field(ui, "Wave speed m/s (other)", &mut self.c_other);
             field(ui, "Fix transmitted f₀ (Hz, optional)", &mut self.f0);
-            field(ui, "Search ± Hz", &mut self.span);
-            field(ui, "Raw IQ sample rate (S/s)", &mut self.rate);
+            field_auto(ui, "Search ± Hz (blank: scan)", &mut self.span, au[2].as_deref());
+            field_auto(ui, "Raw IQ sample rate (S/s)", &mut self.rate, au[3].as_deref());
             ui.label("Raw IQ format");
-            egui::ComboBox::from_id_salt("fmt").selected_text(format!("{:?}", self.fmt).to_lowercase()).show_ui(ui, |ui| {
-                for f in [RawFormat::Cs16, RawFormat::Cf32, RawFormat::Cu8] {
-                    ui.selectable_value(&mut self.fmt, f, format!("{f:?}").to_lowercase());
-                }
+            ui.horizontal(|ui| {
+                let name = |f: Option<RawFormat>| f.map_or("auto".to_string(), |f| format!("{f:?}").to_lowercase());
+                egui::ComboBox::from_id_salt("fmt").selected_text(name(self.fmt)).show_ui(ui, |ui| {
+                    for f in [None, Some(RawFormat::Cs16), Some(RawFormat::Cf32), Some(RawFormat::Cu8)] {
+                        ui.selectable_value(&mut self.fmt, f, name(f));
+                    }
+                });
+                if self.fmt.is_none() { small(ui, &au[4]); }
             });
             ui.end_row();
             ui.label("Q stored before I");
             ui.checkbox(&mut self.swap, "swap IQ");
             ui.end_row();
-            field(ui, "Tone band low (Hz, optional)", &mut self.band_lo);
-            field(ui, "Tone band high (Hz, optional)", &mut self.band_hi);
+            let band_auto = if self.band_lo.trim().is_empty() && self.band_hi.trim().is_empty() { au[5].as_deref() } else { None };
+            field_auto(ui, "Tone band low (Hz, optional)", &mut self.band_lo, band_auto);
+            field_auto(ui, "Tone band high (Hz, optional)", &mut self.band_hi, band_auto);
             ui.label("Burst signal");
-            ui.checkbox(&mut self.burst, "short FSK bursts (satellites)");
+            ui.vertical(|ui| {
+                ui.checkbox(&mut self.burst, "short FSK bursts (satellites)");
+                if !self.burst { small(ui, &au[6]); }
+            });
             ui.end_row();
             field(ui, "Laser file: pass to plot", &mut self.which);
             ui.label("Output folder (blank: next to file)");
@@ -503,8 +615,8 @@ impl App {
                 tags
             });
         paint_tags(ui, &resp.transform, &resp.inner);
-        ui.label(format!("left over: {} path (smooth pattern {:.1} Hz rms, scatter {:.1} Hz rms, p = {})",
-            r.path_word(), r.path.pattern_rms_hz, r.path.scatter_rms_hz, fit::fg(r.path.p_value, 2)));
+        ui.label(format!("left over: {} (smooth pattern {:.1} Hz rms, scatter {:.1} Hz rms, p = {}, detectable from {:.1} Hz rms)",
+            r.path_word(), r.path.pattern_rms_hz, r.path.scatter_rms_hz, fit::fg(r.path.p_value, 2), r.path.detectable_rms_hz));
         let left: Vec<[f64; 2]> = r.t.iter().zip(&r.left).map(|(t, l)| [t - t0, *l]).collect();
         let lm = extent(r.left.iter()).map_or(1.0, |[a, b]| a.abs().max(b.abs()) * 1.1);
         Plot::new(("left", self.run)).height(ui.available_height()).link_axis(link, [true, false])
@@ -658,6 +770,8 @@ impl App {
             p(ui, "Turn it around:");
             eq(ui, "10. d = Δt · v · √3/2");
             here(ui, fit.map(|r| format!("d = {:.2} s × {} × √3/2 = {}", r.marks.dt_s, spd(r.p[1]), len(r.marks.d_width_m))));
+            ui.add_space(8.0);
+            half_plateau_diagram(ui, fit);
 
             h(ui, "The slope at the middle gives the distance again");
             p(ui, "At closest approach τ = 0. Near there r' is close to v² τ / d, so the curve falls in a straight line:");
@@ -679,7 +793,7 @@ impl App {
             p(ui, "J is the table of how each point's f(t) changes when one value changes.");
             here(ui, fit.map(|r| format!("k = {}", fit::fg(r.indep, 3))));
 
-            h(ui, "Straight or bending path");
+            h(ui, "Bending path or not");
             p(ui, "What the fit leaves over at each point:");
             eq(ui, "e_i = f_i − f(t_i)");
             p(ui, "A straight path leaves scatter around zero. A bending path leaves a smooth wave. \
@@ -689,9 +803,19 @@ impl App {
             eq(ui, "F = ((RSS₀ − RSS₁) / 7) / (RSS₁ / (n_eff − 7))");
             p(ui, "RSS₀ is the sum of squares of the leftover. RSS₁ is the same after the polynomial is taken away. \
                 p is the chance of an F this large from scatter alone.");
-            eq(ui, "p below 0.001  →  bending.   Otherwise straight.");
+            eq(ui, "p below 0.001  →  bending.   Otherwise no bending detected.");
             here(ui, fit.map(|r| format!("smooth pattern {:.1} Hz rms, scatter {:.1} Hz rms, p = {}: {}",
                 r.path.pattern_rms_hz, r.path.scatter_rms_hz, fit::fg(r.path.p_value, 2), r.path_word())));
+            p(ui, "The smallest smooth pattern the test can see. N is the number of points, A the pattern rms, s the scatter rms. \
+                The polynomial is a least-squares fit, so its part and the scatter add up:");
+            eq(ui, "RSS₀ − RSS₁ = N A²");
+            eq(ui, "RSS₁ = N s²");
+            eq(ui, "F = (N A² / 7) / (N s² / (n_eff − 7))");
+            eq(ui, "F = (A² / s²) · (n_eff − 7) / 7");
+            p(ui, "Bending when F reaches F_crit, the value that F from scatter alone passes with a chance of 0.001:");
+            eq(ui, "A² = s² · F_crit · 7 / (n_eff − 7)");
+            eq(ui, "A_min = s · √(F_crit · 7 / (n_eff − 7))");
+            here(ui, fit.map(|r| format!("A_min = {:.1} Hz rms (this recording)", r.path.detectable_rms_hz)));
 
             h(ui, "How the trace is measured");
             p(ui, "1.  Lower the sample rate to about 48,000 samples a second. Remove the receiver's DC line.");
@@ -738,10 +862,9 @@ impl App {
             match rx.try_recv() {
                 Ok((true, p)) => { self.out = p.display().to_string(); self.picker = None; }
                 Ok((false, p)) => {
-                    if let Some(c) = p.file_name().and_then(|n| centre_from_name(&n.to_string_lossy())) { self.centre = c; }
                     self.file = p.display().to_string();
                     self.start.clear();
-                    self.span = "15000".into();
+                    self.span.clear();
                     self.picker = None;
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => self.picker = None,
@@ -780,9 +903,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn name_centre_and_waterfall_image() {
-        assert_eq!(centre_from_name("x_12Hz_437800000Hz_IQ").as_deref(), Some("437800000"));
-        assert_eq!(centre_from_name("rec_1000Hz"), None);
+    fn waterfall_image_colours() {
         let mut db = vec![0.0f32; 15];
         db[2 * 5 + 4] = 12.5;
         let w = trace::Waterfall { t: vec![0.0, 0.5, 1.0], f: (0..5).map(|j| j as f64).collect(), db };

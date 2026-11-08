@@ -63,11 +63,13 @@ Start the program with no arguments:
 doppler-kit
 ```
 
-1. Press Browse and pick the recording. An SDR++ file name holds the centre frequency (`baseband_437800000Hz_...`), and the field fills in.
-2. Fill in the centre frequency if the file name does not hold it.
-   For receiver audio, give the dial frequency (USB). For a sound recording, leave it blank.
+1. Press Browse and pick the recording.
+2. Leave a field blank and the kit works the value out from the file (see "Blank fields" below).
+   For receiver audio, type the dial frequency (USB). The kit cannot find a dial frequency. For a sound recording, leave the centre blank.
 3. For a sound recording choose "sound in air (343 m/s)".
 4. Press Run.
+
+After a run, each worked-out value shows in its empty field as "auto: ...". The values you type stay as you typed them.
 
 The tabs show the results, the waterfall, the S-curve and the marked waterfall.
 The Results tab lists every number: v, d, t₀, f₀, the plateaus, the half-plateau points and Δt,
@@ -93,7 +95,7 @@ Examples:
 
 ```
 doppler-kit run my_recording.wav
-doppler-kit run my_recording.wav --center 145800000 --start 2026-06-14T18:10:09Z
+doppler-kit run my_recording.wav --center 145800000 --start 2026-06-01T12:00:00Z
 doppler-kit run iq_5408034.raw --rate 48000 --center 437800000            # raw 16-bit IQ
 doppler-kit run capture.cf32 --rate 250000 --center 437800000 --format cf32
 doppler-kit run beacon_usb.ogg --center 145796000                         # receiver audio, dial frequency
@@ -108,9 +110,9 @@ Options:
 
 - `--center`: the centre frequency of the recording in Hz.
 - `--start`: the UTC start time of the recording. The trace and t₀ then also carry UTC times.
-- `--span`: search ± Hz around the centre. The default is 15000.
+- `--span`: search ± Hz around the centre. The default comes from the scan (see "Blank fields").
 - `--rate`: the sample rate of a raw IQ file.
-- `--format`: the sample type of a raw IQ file. The default is `cs16`.
+- `--format`: the sample type of a raw IQ file. The default comes from SigMF, else `cs16`.
 - `--swap-iq`: Q is stored before I.
 - `--band LO HI`: search only this band. See "Tone band" below.
 - `--burst`: the signal comes in short bursts. See "Burst signals" below.
@@ -119,6 +121,36 @@ Options:
 - `--out`: the output folder. The default is the folder of the input file.
 
 `fit` also takes a trace from anywhere else: a CSV with the columns `t_s` and `f_Hz`.
+
+### Blank fields
+
+A value you type always wins. For each blank field the kit looks in the file, in this order, and logs the value with its source,
+for example `auto: centre 437,800,000 Hz (from file name)`.
+
+1. SigMF: a `FILE.sigmf-meta` beside `FILE.sigmf-data` (or pick the `.sigmf-meta` file). It gives the sample rate,
+   the sample format (`ci16_le`, `cf32_le`, `cu8`), the centre frequency and the start time.
+2. WAV header: the sample rate, the channels and the sample size.
+3. File name: an SDR++ name holds the centre frequency (`..._437800000Hz_...`).
+4. SatNOGS: a file `iq_<observation id>.raw` is 48,000 S/s, 16-bit. The kit asks network.satnogs.org for the start time
+   and the centre frequency of the observation. It sends only the observation id. When the computer is offline, the kit says so and goes on.
+5. Start time: when no other source has it, the kit takes the time the file was last changed and subtracts the length of the recording.
+   The log marks this value "check it". Copying a file can change this time.
+
+Radio needs the real centre frequency for v. It must come from the file name, SigMF, SatNOGS or you.
+
+**Search span (scan).** When the span is blank, the kit first looks over the full recorded band. It takes short spectra
+spread over the whole file, divides every frequency bin by its median over time (a steady line goes to 1) and follows the strongest
+line that falls in frequency. It looks near the centre first (±21.6 kHz), then over the whole band. The span then covers the line
+plus a margin, and stays at 15,000 Hz when the line fits inside. A line outside the default window moves the centre to it.
+When no moving line is found, the span is 15,000 Hz and the log says so.
+
+**Tone band (audio).** When no band is given, the same scan picks the strongest tone that moves (falls in frequency) and sets the band
+around its swing. A steady tone, such as low engine rumble, does not count. When the strongest tone in the recording is the moving one,
+no band is needed and the kit tracks it as before.
+
+**Burst mode.** When "Burst" is not ticked and the trace looks like bursts (it covers less than 30% of the recording, moves less than
+a fifth of the span, or does not fit a pass cleanly), the kit also runs burst mode. It keeps the clean pass that covers more of the
+recording and logs which one it used and why. A tick (`--burst`) forces burst mode.
 
 On Windows the program does not open a console window of its own.
 The command line writes to the console it was started from.
@@ -144,16 +176,15 @@ The normal tracer then follows a steady line or only part of a packet.
 `--burst` finds the packets under the steady lines and gives one point for each half second that holds a packet.
 The trace file has the same columns, so `fit` works the same way.
 
-When you do not give `--burst` and the trace covers less than 30% of an IQ recording, or moves less than a fifth of the span,
-the kit prints a note that suggests `--burst`.
+When you do not give `--burst`, the kit tries burst mode by itself when the trace looks like bursts (see "Blank fields").
 
 ## Output
 
 | File | Content |
 |---|---|
 | `<name>_trace.csv` | `t_s, utc, f_offset_Hz, f_Hz, snr_dB`: received frequency against time |
-| `<name>_summary.json` | settings (with `band_Hz` and `burst`), number of points, point noise, the frequency swing, fixed receiver lines found |
-| `<name>_fit.json` | v, d, t₀, f₀ with errors (full fit), the plateau estimate, the marks, the path test, the distances at the first and last point |
+| `<name>_summary.json` | settings (with `band_Hz` and `burst`), number of points, point noise, the frequency swing, fixed receiver lines found, and under `auto` every value the kit worked out, with its source |
+| `<name>_fit.json` | v, d, t₀, f₀ with errors (full fit), the plateau estimate, the marks, the path test with `detectable_rms_Hz`, the distances at the first and last point |
 | `<name>_slr.csv` | laser ranging: v, d, closest time, shots and fit miss for every pass |
 
 ## What to record
@@ -226,7 +257,19 @@ where τ is the emission time from closest approach. Read off the curve:
 
 What the fit leaves over shows the path: a straight path leaves scatter around zero, a bending path leaves a smooth wave.
 The kit fits a degree-6 polynomial through the leftover and compares it with the scatter (F-test, counting only independent points).
-When the smooth part stands out (p below 0.001) the path is reported as bending, otherwise as straight.
+When the smooth part stands out (p below 0.001) the path is reported as bending, otherwise as "no bending detected".
+
+The report also gives the smallest smooth pattern this recording can detect. With N points, pattern rms A, scatter rms s
+and the F-test degrees of freedom d₁ = 7 and d₂ = n_eff − 7:
+
+    RSS₀ − RSS₁ = N A²
+    RSS₁ = N s²
+    F = (A² / s²) · d₂ / d₁
+    bending when F ≥ F_crit, the 0.999 point of the F(d₁, d₂) distribution
+    A_min = s · √(F_crit · d₁ / d₂)
+
+A_min is `detectable_rms_Hz` in the fit file. A smaller pattern can be there and not be seen.
+The Math tab shows these steps and the half-plateau triangle with the numbers of the current run.
 
 ## Laser ranging
 

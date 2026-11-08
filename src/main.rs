@@ -16,7 +16,9 @@ Usage:
   doppler-kit laser SRC [--pass N] [--out DIR]      SRC: CRD file (.np2/.npt/.crd) or EDC page URL
 
   --band LO HI: audio: track the tone between LO and HI Hz; IQ: search offsets LO to HI Hz from the centre.
-  --burst: the signal comes in short bursts (FSK/packet satellites).
+  --burst: the signal comes in short bursts (FSK/packet satellites); without it, tried when the trace looks like bursts.
+  Blank options are worked out from the file (SigMF meta, WAV header, SDR++ file name, SatNOGS observation,
+  file time) and logged with their source; --span blank: a scan of the whole band; --band blank (audio): the moving tone.
   --c defaults to 299792458 (radio / light); use 343 for sound in air.";
 
 pub const LASER_EXT: [&str; 5] = ["np2", "npt", "crd", "html", "htm"];
@@ -41,7 +43,11 @@ pub fn report_text(s: &trace::TraceResult, f: &fit::FitResult, fit_json: &Path) 
         String::new(),
     ];
     l.extend(f.report_lines());
-    for n in [&s.note, &s.burst_hint].into_iter().flatten() { l.extend([String::new(), format!("NOTE: {n}")]); }
+    if !s.auto.is_empty() {
+        l.extend([String::new(), "AUTO VALUES (from the file; a value you type always wins)".into()]);
+        l.extend(s.auto.iter().map(|(_, v)| format!("  {v}")));
+    }
+    if let Some(n) = &s.note { l.extend([String::new(), format!("NOTE: {n}")]); }
     l.extend([String::new(), "Files:".into()]);
     l.extend([&s.csv_path, &s.summary_path, &fit_json.to_path_buf()].iter().map(|p| format!("  {}", p.display())));
     l.join("\n") + "\n"
@@ -102,9 +108,9 @@ impl Args {
         Ok(trace::TraceOpts {
             center: self.n("center")?,
             start: self.s("start"),
-            span: self.n("span")?.unwrap_or(15000.0),
+            span: self.n("span")?,
             rate: self.n("rate")?,
-            format: self.s("format").map_or(Ok(RawFormat::Cs16), |f| f.parse())?,
+            format: self.s("format").map(|f| f.parse::<RawFormat>()).transpose()?,
             swap_iq: self.swap,
             out: self.out(),
             band: self.band,

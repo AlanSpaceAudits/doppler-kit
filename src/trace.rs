@@ -46,20 +46,22 @@ pub const NO_BURSTS: &str = "no bursts found: check --center, --span and --band"
 pub struct TraceOpts {
     pub center: Option<f64>,
     pub start: Option<String>,
-    pub span: f64,
+    /// Search +- Hz around the centre; None: found by a scan of the whole band.
+    pub span: Option<f64>,
     pub rate: Option<f64>,
-    pub format: RawFormat,
+    /// Raw IQ sample type; None: from SigMF, else cs16.
+    pub format: Option<RawFormat>,
     pub swap_iq: bool,
     pub out: Option<PathBuf>,
     /// Tone band (lo, hi) in Hz: audio frequencies for audio, offsets from the centre for IQ.
     pub band: Option<(f64, f64)>,
-    /// Short-burst mode (FSK/packet satellites).
+    /// Short-burst mode (FSK/packet satellites); off: tried when the trace looks like bursts.
     pub burst: bool,
 }
 
 impl Default for TraceOpts {
     fn default() -> Self {
-        Self { center: None, start: None, span: 15000.0, rate: None, format: RawFormat::Cs16, swap_iq: false, out: None, band: None, burst: false }
+        Self { center: None, start: None, span: None, rate: None, format: None, swap_iq: false, out: None, band: None, burst: false }
     }
 }
 
@@ -99,8 +101,8 @@ pub struct TraceResult {
     pub fixed_receiver_lines_hz: Vec<f64>,
     pub window: String,
     pub note: Option<String>,
-    /// Suggests --burst when an IQ trace covers little of the recording or hardly moves (not in the JSON file).
-    pub burst_hint: Option<String>,
+    /// Values worked out from the file, (field, text with its source): centre, start, rate, format, span, band, burst.
+    pub auto: Vec<(String, String)>,
     pub waterfall: Waterfall,
     pub csv_path: PathBuf,
     pub summary_path: PathBuf,
@@ -393,7 +395,24 @@ fn peak_interp(row: &[f32], j: usize) -> f64 {
     }
 }
 
-fn uniform_filter_reflect(x: &[f32], size: usize) -> Vec<f32> {
+/// f32 / f64 samples for the shared filters.
+trait Sample: Copy {
+    fn f(self) -> f64;
+    fn of(v: f64) -> Self;
+    fn tcmp(&self, o: &Self) -> std::cmp::Ordering;
+}
+impl Sample for f32 {
+    fn f(self) -> f64 { self as f64 }
+    fn of(v: f64) -> Self { v as f32 }
+    fn tcmp(&self, o: &Self) -> std::cmp::Ordering { self.total_cmp(o) }
+}
+impl Sample for f64 {
+    fn f(self) -> f64 { self }
+    fn of(v: f64) -> Self { v }
+    fn tcmp(&self, o: &Self) -> std::cmp::Ordering { self.total_cmp(o) }
+}
+
+fn uniform_filter_reflect<T: Sample>(x: &[T], size: usize) -> Vec<T> {
     let n = x.len() as i64;
     let refl = |mut i: i64| -> usize {
         let p = 2 * n;
@@ -401,11 +420,11 @@ fn uniform_filter_reflect(x: &[f32], size: usize) -> Vec<f32> {
         (if i >= n { p - 1 - i } else { i }) as usize
     };
     let (s1, s2) = ((size / 2) as i64, (size - size / 2 - 1) as i64);
-    let mut acc: f64 = (-s1..=s2).map(|o| x[refl(o)] as f64).sum();
+    let mut acc: f64 = (-s1..=s2).map(|o| x[refl(o)].f()).sum();
     let mut out = Vec::with_capacity(x.len());
     for i in 0..n {
-        out.push((acc / size as f64) as f32);
-        acc += x[refl(i + s2 + 1)] as f64 - x[refl(i - s1)] as f64;
+        out.push(T::of(acc / size as f64));
+        acc += x[refl(i + s2 + 1)].f() - x[refl(i - s1)].f();
     }
     out
 }
@@ -1062,23 +1081,23 @@ pub fn track(y: &[Complex32], fsd: f64, span: f64, dc: Option<f64>, cut: bool) -
 }
 
 /// Running median over `2 * half + 1` samples, edges repeated (scipy median_filter, mode "nearest").
-fn running_median(x: &[f32], half: usize) -> Vec<f32> {
+fn running_median<T: Sample>(x: &[T], half: usize) -> Vec<T> {
     let n = x.len();
     if n == 0 {
         return Vec::new();
     }
     let at = |i: i64| x[i.clamp(0, n as i64 - 1) as usize];
     let h = half as i64;
-    let mut win: Vec<f32> = (-h..=h).map(at).collect();
-    win.sort_by(|a, b| a.total_cmp(b));
+    let mut win: Vec<T> = (-h..=h).map(at).collect();
+    win.sort_by(|a, b| a.tcmp(b));
     let mut out = Vec::with_capacity(n);
     for i in 0..n as i64 {
         out.push(win[half]);
         let old = at(i - h);
-        let p = win.partition_point(|v| v.total_cmp(&old).is_lt());
+        let p = win.partition_point(|v| v.tcmp(&old).is_lt());
         win.remove(p);
         let new = at(i + h + 1);
-        let q = win.partition_point(|v| v.total_cmp(&new).is_lt());
+        let q = win.partition_point(|v| v.tcmp(&new).is_lt());
         win.insert(q, new);
     }
     out
@@ -1171,8 +1190,8 @@ fn waterfall(y: &[Complex32], fsd: f64, span: f64) -> Waterfall {
     Waterfall { t: gr.t, f: gr.f, db }
 }
 
-/// Audio: keep the positive frequencies only and move the strongest tone (above 50 Hz) to 0 Hz.
-fn to_analytic(x: &[f32], fsd: f64) -> (Vec<Complex32>, f64) {
+/// Audio: the strongest tone above 50 Hz in the average spectrum (Welch, 8192 samples).
+fn strongest_tone(x: &[f32], fsd: f64) -> f64 {
     let n = x.len();
     let nps = 8192.min(n);
     let step = nps - nps / 2;
@@ -1200,7 +1219,12 @@ fn to_analytic(x: &[f32], fsd: f64) -> (Vec<Complex32>, f64) {
         Some(j) if p[j] >= p[k] => Some(j),
         _ => Some(k),
     });
-    let tone = best.map(fk).unwrap_or(0.0);
+    best.map(fk).unwrap_or(0.0)
+}
+
+/// Audio: keep the positive frequencies only and move `tone` (Hz) to 0 Hz.
+fn to_analytic(x: &[f32], fsd: f64, tone: f64) -> Vec<Complex32> {
+    let n = x.len();
     // scipy.signal.hilbert keeps float32 input in complex64; its rounding floor in the empty half feeds fixed_lines()
     let mut a: Vec<Complex32> = x.iter().map(|&v| Complex32::new(v, 0.0)).collect();
     let mut p32 = FftPlanner::<f32>::new();
@@ -1223,7 +1247,233 @@ fn to_analytic(x: &[f32], fsd: f64) -> (Vec<Complex32>, f64) {
             Complex32::new((re * c - im * s) as f32, (re * s + im * c) as f32)
         })
         .collect();
-    (y, tone)
+    y
+}
+
+// ---------- auto values: signal scan ----------
+const SCAN_FRAMES: u64 = 400;
+const SCAN_SAMPLES: u64 = 1 << 26;
+const SCAN_SLEW_HZ_S: f64 = 500.0;
+const SCAN_ON_DB: f64 = 3.0;
+const SCAN_CAP_DB: f64 = 20.0;
+pub const DEFAULT_SPAN: f64 = 15000.0;
+
+/// Coarse spectra of the full recorded band: frames of nblk Hann blocks (power averaged) at M times spread evenly
+/// over the file. IQ: bins about fs/64 wide, frames up to 1 s; audio: about fs/16, up to 0.25 s. Rows are fftshifted.
+pub struct ScanSpectra { pub t: Vec<f64>, pub f: Vec<f64>, pub p: Vec<Vec<f64>> }
+
+pub fn scan_spectra(inp: &input::Input, swap: bool, audio: bool) -> Result<Option<ScanSpectra>, String> {
+    let (fs, n) = (inp.rate as f64, inp.n);
+    let nfft = 1usize << (fs / if audio { 16.0 } else { 64.0 }).log2().round().max(0.0) as u32;
+    let nblk = 1.max(16.min((fs * if audio { 0.25 } else { 1.0 }) as usize / nfft));
+    let l = (nblk * nfft) as u64;
+    if nfft < 16 || n < 10 * l {
+        return Ok(None);
+    }
+    let m = (n / l).min(SCAN_FRAMES.max(SCAN_SAMPLES / l));
+    let w: Vec<f64> = (0..nfft).map(|k| 0.5 - 0.5 * (2.0 * std::f64::consts::PI * k as f64 / (nfft - 1) as f64).cos()).collect();
+    let fft = FftPlanner::<f64>::new().plan_fft_forward(nfft);
+    let (mut t, mut p) = (Vec::with_capacity(m as usize), Vec::with_capacity(m as usize));
+    let mut buf = vec![Complex::<f64>::new(0.0, 0.0); nfft];
+    for k in 0..m {
+        let st = k * (n - l) / (m - 1);
+        let z = inp.read_at(st, l as usize, swap)?;
+        let mut acc = vec![0.0f64; nfft];
+        for b in 0..nblk {
+            for q in 0..nfft {
+                let v = z.get(b * nfft + q).copied().unwrap_or_default();
+                buf[q] = Complex::new(v.re as f64 * w[q], v.im as f64 * w[q]);
+            }
+            fft.process(&mut buf);
+            for (a, x) in acc.iter_mut().zip(&buf) {
+                *a += x.re * x.re + x.im * x.im;
+            }
+        }
+        p.push((0..nfft).map(|j| acc[(j + nfft - nfft / 2) % nfft] / nblk as f64).collect());
+        t.push((st as f64 + l as f64 / 2.0) / fs);
+    }
+    let val = fs / nfft as f64;
+    let f = (0..nfft).map(|k| (k as i64 - (nfft / 2) as i64) as f64 * val).collect();
+    Ok(Some(ScanSpectra { t, f, p }))
+}
+
+/// Column per row of the path with the largest sum of v that never moves up and moves down at most d columns from
+/// one row to the next (the received frequency of a passing source only falls). Ties: the smallest step, then the lowest column.
+fn strongest_path(v: &[Vec<f64>], d: usize) -> Vec<usize> {
+    let (m, n) = (v.len(), v[0].len());
+    let mut s = v[0].clone();
+    let mut back = vec![vec![0u32; n]; m];
+    for k in 1..m {
+        let mut ns = vec![0.0; n];
+        for j in 0..n {
+            let (mut best, mut arg) = (f64::NEG_INFINITY, j);
+            for dd in 0..=d {
+                if j + dd < n && s[j + dd] > best {
+                    best = s[j + dd];
+                    arg = j + dd;
+                }
+            }
+            ns[j] = v[k][j] + best;
+            back[k][j] = arg as u32;
+        }
+        s = ns;
+    }
+    let mut j = vec![0usize; m];
+    j[m - 1] = argmax(&s);
+    for k in (1..m).rev() {
+        j[k - 1] = back[k][j[k]] as usize;
+    }
+    j
+}
+
+/// numpy.percentile (linear).
+fn percentile(v: &[f64], q: f64) -> f64 {
+    let mut s = v.to_vec();
+    s.sort_by(|a, b| a.total_cmp(b));
+    let h = (s.len() - 1) as f64 * q / 100.0;
+    let (lo, hi) = (h.floor() as usize, h.ceil() as usize);
+    s[lo] + (s[hi] - s[lo]) * (h - lo as f64)
+}
+
+/// The strongest falling path over the bins in `keep`. A path that moves less than min_move (5th to 95th percentile of
+/// its strong frames) is masked (+-mask_half around its median) and the search runs again, 3 times at most.
+fn moving_line(t: &[f64], f: &[f64], v: &[Vec<f64>], keep: &[bool], min_move: f64, mask_half: f64) -> Option<(f64, f64, usize)> {
+    let cols: Vec<usize> = (0..f.len()).filter(|&j| keep[j]).collect();
+    if cols.len() < 3 || t.len() < 2 {
+        return None;
+    }
+    let (c0, c1) = (cols[0], cols[cols.len() - 1] + 1);
+    let ff = &f[c0..c1];
+    let mut vv: Vec<Vec<f64>> = v.iter().map(|r| (c0..c1).map(|j| if keep[j] { r[j] } else { 0.0 }).collect()).collect();
+    let d = 1usize.max((SCAN_SLEW_HZ_S * (t[1] - t[0]) / (f[1] - f[0])).ceil() as usize);
+    for _ in 0..3 {
+        let j = strongest_path(&vv, d);
+        let fo: Vec<f64> = (0..t.len()).filter(|&k| vv[k][j[k]] > SCAN_ON_DB).map(|k| ff[j[k]]).collect();
+        if fo.len() < 8 {
+            return None;
+        }
+        let (lo, hi) = (percentile(&fo, 5.0), percentile(&fo, 95.0));
+        if hi - lo >= min_move {
+            return Some((lo, hi, fo.len()));
+        }
+        let md = median_of(fo.iter().copied());
+        for r in vv.iter_mut() {
+            for (x, &fr) in r.iter_mut().zip(ff) {
+                if (fr - md).abs() < mask_half {
+                    *x = 0.0;
+                }
+            }
+        }
+    }
+    None
+}
+
+fn to_db_value(r: f64) -> f64 {
+    (10.0 * r.log10() - SCAN_ON_DB).clamp(0.0, SCAN_CAP_DB)
+}
+
+/// IQ: every bin over its median in time (steady lines go to 1), every frame over its median, 300 Hz boxcar.
+/// First the default window (+-21.6 kHz), then the full band. Returns (lo, hi, frames) in Hz from the centre.
+pub fn scan_iq(sc: &ScanSpectra, fs: f64) -> Option<(f64, f64, usize)> {
+    let (t, f) = (&sc.t, &sc.f);
+    let df = f[1] - f[0];
+    let nf = f.len();
+    let colmed: Vec<f64> = (0..nf).map(|j| median_of(sc.p.iter().map(|r| r[j]))).collect();
+    let size = 1usize.max((300.0 / df).round_ties_even() as usize);
+    let v: Vec<Vec<f64>> = sc.p.iter().map(|r| {
+        let mut x: Vec<f64> = r.iter().zip(&colmed).map(|(a, m)| a / m).collect();
+        let rm = median_of(x.iter().copied());
+        x.iter_mut().for_each(|a| *a /= rm);
+        uniform_filter_reflect(&x, size).into_iter().map(to_db_value).collect()
+    }).collect();
+    let near_lim = (0.45 * fs).min(0.45 * TARGET);
+    let mut lims = vec![near_lim];
+    if 0.45 * fs > near_lim {
+        lims.push(0.45 * fs);
+    }
+    let mv = (10.0 * df).max(1000.0);
+    lims.into_iter().find_map(|lim| moving_line(t, f, &v, &f.iter().map(|x| x.abs() <= lim).collect::<Vec<_>>(), mv, mv))
+}
+
+/// Audio: positive frequencies 50 Hz to 0.45 fs, each spectrum over its running median across 1 kHz (tones stand out,
+/// broadband sound does not), every bin over its median in time (steady tones go to 1), 50 Hz boxcar.
+pub fn scan_audio(sc: &ScanSpectra, fs: f64) -> Option<(f64, f64, usize)> {
+    let df = sc.f[1] - sc.f[0];
+    let idx: Vec<usize> = (0..sc.f.len()).filter(|&j| sc.f[j] >= 50.0 && sc.f[j] <= 0.45 * fs).collect();
+    if idx.len() < 3 {
+        return None;
+    }
+    let f: Vec<f64> = idx.iter().map(|&j| sc.f[j]).collect();
+    let half = ((1000.0 / df).round_ties_even() as usize / 2 * 2 + 1) / 2;
+    let c: Vec<Vec<f64>> = sc.p.iter().map(|r| {
+        let x: Vec<f64> = idx.iter().map(|&j| r[j]).collect();
+        let m = running_median(&x, half);
+        x.iter().zip(&m).map(|(a, b)| a / b).collect()
+    }).collect();
+    let colmed: Vec<f64> = (0..f.len()).map(|j| median_of(c.iter().map(|r| r[j]))).collect();
+    let size = 1usize.max((50.0 / df).round_ties_even() as usize);
+    let v: Vec<Vec<f64>> = c.iter().map(|r| {
+        let x: Vec<f64> = r.iter().zip(&colmed).map(|(a, m)| a / m).collect();
+        uniform_filter_reflect(&x, size).into_iter().map(to_db_value).collect()
+    }).collect();
+    moving_line(&sc.t, &f, &v, &vec![true; f.len()], (5.0 * df).max(100.0), (5.0 * df).max(200.0))
+}
+
+/// (centre shift, search span) covering lo..hi (Hz from the centre) plus a margin; the default span when it fits.
+pub fn span_from_scan(lo: f64, hi: f64) -> (i64, f64) {
+    let m = 2000f64.max(0.1 * (hi - lo));
+    let (a, b) = (lo - m, hi + m);
+    if a >= -DEFAULT_SPAN && b <= DEFAULT_SPAN {
+        return (0, DEFAULT_SPAN);
+    }
+    let shift = 1000 * ((a + b) / 2000.0 + 0.5).floor() as i64;
+    let sh = shift as f64;
+    (shift, DEFAULT_SPAN.max(500.0 * ((b - sh).max(sh - a) / 500.0).ceil()))
+}
+
+pub fn band_from_scan(lo: f64, hi: f64, fs: f64) -> (f64, f64) {
+    let m = 50f64.max(0.25 * (hi - lo));
+    ((10.0 * ((lo - m) / 10.0).floor()).max(0.0), (10.0 * ((hi + m) / 10.0).ceil()).min((0.45 * fs).floor()))
+}
+
+/// Accepted points of a trace against the pass shape: clean when >= 20 points, the swing is at least a fifth of the
+/// span (not a steady line) and the soft-L1 pass fit leaves at most 3 x the point noise (rms). (clean, why, cover).
+fn pass_quality(tr: &Track, tt: f64, span: f64) -> (bool, String, f64) {
+    let (t, f): (Vec<f64>, Vec<f64>) = (0..tr.t.len()).filter(|&i| tr.acc[i]).map(|i| (tr.t[i], tr.lc[i])).unzip();
+    if t.len() < 20 {
+        return (false, "fewer than 20 points".into(), 0.0);
+    }
+    let ext = |v: &[f64]| v.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), &x| (a.min(x), b.max(x)));
+    let ((t0, t1), (f0, f1)) = (ext(&t), ext(&f));
+    let (swing, cover) = (f1 - f0, (t1 - t0) / tt);
+    if swing < 0.2 * span {
+        return (false, format!("moves only {} Hz", fmt_f(swing, 0)), cover);
+    }
+    let p = robust_pass(&t, &f, tt, span);
+    let rms = (t.iter().zip(&f).map(|(&x, &y)| (y - pass_model(x, &p)).powi(2)).sum::<f64>() / t.len() as f64).sqrt();
+    let noise = if tr.sigma.is_finite() { tr.sigma.max(1.0) } else { 1.0 };
+    if rms > 3.0 * noise {
+        return (false, format!("pass fit leaves {} Hz rms against point noise {} Hz", fmt_f(rms, 0), fmt_f(noise, 0)), cover);
+    }
+    (true, format!("covers {}% of the recording", fmt_f(100.0 * cover, 0)), cover)
+}
+
+/// Mixes a stream down by `shift` Hz (integer) with the exact phase index (k * shift) mod fs.
+struct Mixer<'a> { inner: &'a mut dyn BlockReader, pos: u64, shift: i64, fs: i64 }
+
+impl BlockReader for Mixer<'_> {
+    fn read(&mut self, out: &mut Vec<Complex32>, max: usize) -> Result<usize, String> {
+        let a = out.len();
+        let k = self.inner.read(out, max)?;
+        for (q, v) in out[a..].iter_mut().enumerate() {
+            let ph = ((self.pos + q as u64) as i128 * self.shift as i128).rem_euclid(self.fs as i128) as f64;
+            let (s, c) = (-2.0 * std::f64::consts::PI * ph / self.fs as f64).sin_cos();
+            let (re, im) = (v.re as f64, v.im as f64);
+            *v = Complex32::new((re * c - im * s) as f32, (re * s + im * c) as f32);
+        }
+        self.pos += k as u64;
+        Ok(k)
+    }
 }
 
 // ---------- time and text ----------
@@ -1249,7 +1499,7 @@ fn civil_from_days(z: i64) -> (i64, i64, i64) {
 
 /// ISO time as (microseconds since 1970 in its own clock, UTC offset in minutes if given).
 pub fn parse_iso(s: &str) -> Result<(i64, Option<i64>), String> {
-    let bad = || format!("cannot read the start time '{s}' (use e.g. 2026-06-14T18:10:09Z)");
+    let bad = || format!("cannot read the start time '{s}' (use e.g. 2026-06-01T12:00:00Z)");
     let s = s.trim();
     if !s.is_ascii() {
         return Err(bad());
@@ -1435,6 +1685,9 @@ impl TraceResult {
             ("swing_Hz", py_float(self.swing_hz)),
             ("fixed_receiver_lines_Hz", lines),
             ("window", json_str(&self.window)),
+            ("auto", if self.auto.is_empty() { "{}".into() } else {
+                format!("{{\n{}\n }}", self.auto.iter().map(|(k, v)| format!("  {}: {}", json_str(k), json_str(v))).collect::<Vec<_>>().join(",\n"))
+            }),
         ];
         format!("{{\n{}\n}}", kv.iter().map(|(k, v)| format!(" \"{k}\": {v}")).collect::<Vec<_>>().join(",\n"))
     }
@@ -1448,9 +1701,32 @@ impl TraceResult {
     }
 }
 
+/// Unix time (s) as 2025-01-02T03:04:05Z, rounded to the nearest second.
+pub fn utc_text(ts: f64) -> String {
+    let s = (ts + 0.5).floor() as i64;
+    let (y, m, d) = civil_from_days(s.div_euclid(86400));
+    let r = s.rem_euclid(86400);
+    format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z", r / 3600, r / 60 % 60, r % 60)
+}
+
+/// Integer with sign and thousands separators (Python f"{x:+,}").
+fn signed_comma(x: i64) -> String {
+    format!("{}{}", if x < 0 { '-' } else { '+' }, crate::fit::fcomma(x.unsigned_abs() as f64, 0))
+}
+
 /// Trace one recording, write <name>_trace.csv and <name>_summary.json to the output folder
-/// (default: next to the recording) and return everything.
+/// (default: next to the recording) and return everything. Blank options are worked out from the file;
+/// a value given in `o` always wins. Every auto value is logged with its source and kept in `auto`.
 pub fn run(path: &Path, o: &TraceOpts, log: &mut dyn FnMut(&str)) -> Result<TraceResult, String> {
+    use crate::fit::fcomma;
+    let mut auto: Vec<(String, String)> = Vec::new();
+    let mut note = |log: &mut dyn FnMut(&str), k: &str, text: String, indent: &str| {
+        log(&format!("{indent}auto: {text}"));
+        auto.retain(|(a, _)| a != k);
+        auto.push((k.into(), text));
+    };
+    let (path, meta) = input::sigmf_files(path);
+    let path = path.as_path();
     let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("recording").to_string();
     let orig = path.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string();
     let out = match &o.out {
@@ -1458,9 +1734,50 @@ pub fn run(path: &Path, o: &TraceOpts, log: &mut dyn FnMut(&str)) -> Result<Trac
         None => std::path::absolute(path).map_err(|e| e.to_string())?.parent().map(Path::to_path_buf).unwrap_or_default(),
     };
     std::fs::create_dir_all(&out).map_err(|e| format!("{}: {e}", out.display()))?;
-    let fc0 = o.center.or_else(|| sdrpp_centre(&name));
-    let t_start = o.start.as_deref().filter(|s| !s.trim().is_empty()).map(parse_iso).transpose()?;
-    let inp = input::open(path, o.rate, o.format, log)?;
+    let (mut fc0, mut start, mut rate, mut fmt) = (o.center, o.start.clone().filter(|s| !s.trim().is_empty()), o.rate.filter(|&r| r > 0.0), o.format);
+    if let Some(m) = &meta {
+        let sm = input::sigmf_values(m)?;
+        let mname = m.file_name().and_then(|s| s.to_str()).unwrap_or("").to_string();
+        if rate.is_none() {
+            if let Some(r) = sm.rate { rate = Some(r); note(log, "rate", format!("sample rate {} S/s (SigMF {mname})", fcomma(r, 0)), ""); }
+        }
+        if fmt.is_none() {
+            if let Some(f) = sm.fmt { fmt = Some(f); note(log, "format", format!("format {} (SigMF {mname})", format!("{f:?}").to_lowercase()), ""); }
+        }
+        if fc0.is_none() {
+            if let Some(c) = sm.centre { fc0 = Some(c); note(log, "centre", format!("centre {} Hz (SigMF {mname})", fcomma(c, 0)), ""); }
+        }
+        if start.is_none() {
+            if let Some(t) = sm.start { note(log, "start", format!("start {t} (SigMF {mname})"), ""); start = Some(t); }
+        }
+    }
+    if fc0.is_none() {
+        if let Some(c) = sdrpp_centre(&name) { fc0 = Some(c); note(log, "centre", format!("centre {} Hz (from file name)", fcomma(c, 0)), ""); }
+    }
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    let satnogs = if ext == "wav" || input::COMPRESSED.contains(&ext.as_str()) { None } else { input::satnogs_id(&name).map(str::to_string) };
+    if let Some(id) = &satnogs {
+        if fc0.is_none() || start.is_none() {
+            match input::satnogs_values(id) {
+                Ok((c, t)) => {
+                    if fc0.is_none() {
+                        if let Some((c, src)) = c { fc0 = Some(c); note(log, "centre", format!("centre {} Hz (SatNOGS observation {id}, {src})", fcomma(c, 0)), ""); }
+                    }
+                    if start.is_none() {
+                        if let Some(t) = t { note(log, "start", format!("start {t} (SatNOGS observation {id})"), ""); start = Some(t); }
+                    }
+                }
+                Err(e) => log(&format!("auto: SatNOGS observation {id} not read ({e}): give the centre and start time")),
+            }
+        }
+        if rate.is_none() {
+            rate = Some(48000.0); // SatNOGS IQ files: 16-bit IQ at 48,000 S/s
+            fmt = fmt.or(Some(RawFormat::Cs16));
+            note(log, "rate", "sample rate 48,000 S/s, cs16 (SatNOGS IQ file)".into(), "");
+        }
+    }
+    let mtime = input::mtime(path)?;
+    let inp = input::open(path, rate, fmt.unwrap_or_default())?;
     if inp.rate < 100 {
         return Err(format!("sample rate {} S/s is too low", inp.rate));
     }
@@ -1468,42 +1785,91 @@ pub fn run(path: &Path, o: &TraceOpts, log: &mut dyn FnMut(&str)) -> Result<Trac
         return Err("the recording holds no samples".into());
     }
     let audio = inp.audio();
+    let (rate, n) = if inp.compressed { (48000u32, (inp.n as f64 * 48000.0 / inp.rate as f64).ceil() as u64) } else { (inp.rate, inp.n) };
+    let tt = n as f64 / rate as f64;
+    if start.is_none() {
+        let s = utc_text(mtime - tt);
+        note(log, "start", format!("start {s} (file modified time minus length: check it)"), "");
+        start = Some(s);
+    }
+    let t_start = start.as_deref().map(parse_iso).transpose()?;
     if fc0.is_none() && !audio {
-        return Err("give the centre frequency (Hz)".into());
+        return Err("give the centre frequency (Hz): it is not in the file name, a SigMF file or a SatNOGS observation".into());
     }
     let mut fc = fc0.unwrap_or(0.0);
-    let (rate, n) = if inp.compressed { (48000u32, (inp.n as f64 * 48000.0 / inp.rate as f64).ceil() as u64) } else { (inp.rate, inp.n) };
     log(&format!(
         "{name}: {rate} S/s, {}-bit, {}, {:.1} s, centre {:.6} MHz",
         inp.bits,
         if audio { "audio" } else { "IQ" },
-        n as f64 / rate as f64,
+        tt,
         fc / 1e6
     ));
+    let mut band = o.band.map(|(a, b)| (a.min(b), a.max(b)));
+    let (mut shift, mut target, mut auto_band, mut scanned) = (0i64, TARGET, None, false);
+    let mut span = o.span;
+    if !audio && band.is_none() && span.is_none() {
+        let r = scan_spectra(&inp, o.swap_iq, false)?.and_then(|sc| scan_iq(&sc, inp.rate as f64));
+        if let Some((lo, hi, _)) = r {
+            let (sh, sp) = span_from_scan(lo, hi);
+            (shift, span) = (sh, Some(sp));
+            let found = format!("signal found at {:+.1} to {:+.1} kHz", lo / 1e3, hi / 1e3);
+            if sh != 0 {
+                note(log, "span", format!("{found}: centre moved by {} Hz, search \u{b1}{} Hz (scan)", signed_comma(sh), fcomma(sp, 0)), "  ");
+            } else {
+                note(log, "span", format!("{found}, search \u{b1}{} Hz (scan)", fcomma(sp, 0)), "  ");
+            }
+            (target, scanned) = (TARGET.max(2.5 * sp), true);
+        } else {
+            span = Some(DEFAULT_SPAN);
+            note(log, "span", format!("no moving signal found: search \u{b1}{} Hz (scan)", fcomma(DEFAULT_SPAN, 0)), "  ");
+        }
+    } else if audio && band.is_none() {
+        match scan_spectra(&inp, false, true)?.and_then(|sc| scan_audio(&sc, inp.rate as f64)) {
+            Some((lo, hi, _)) => auto_band = Some(band_from_scan(lo, hi, inp.rate as f64)),
+            None => note(log, "band", "no moving tone found: the strongest tone is tracked (scan)".into(), "  "),
+        }
+    }
+    let mut span = span.unwrap_or(DEFAULT_SPAN);
     let mut rd = inp.reader(o.swap_iq)?;
     let (y, fsd) = if inp.compressed {
         (resample(rd.as_mut(), inp.n, 48000, inp.rate as usize, n as usize)?, 48000.0)
     } else {
-        let dec = ((inp.rate as f64 / TARGET).round_ties_even() as usize).max(1);
-        (resample(rd.as_mut(), inp.n, 1, dec, (inp.n / dec as u64) as usize)?, inp.rate as f64 / dec as f64)
+        let dec = ((inp.rate as f64 / target).round_ties_even() as usize).max(1);
+        let n_out = (inp.n / dec as u64) as usize;
+        let y = if shift != 0 {
+            let mut mx = Mixer { inner: rd.as_mut(), pos: 0, shift, fs: inp.rate as i64 };
+            resample(&mut mx, inp.n, 1, dec, n_out)?
+        } else {
+            resample(rd.as_mut(), inp.n, 1, dec, n_out)?
+        };
+        (y, inp.rate as f64 / dec as f64)
     };
     drop(rd);
     drop(inp);
-    let mut span = o.span;
+    if scanned {
+        span = span.min(0.45 * fsd);
+    }
     let (mut tone, mut dc) = (0.0, None);
-    let band = match o.band {
-        Some((a, b)) => {
-            let (lo, hi) = (a.min(b), a.max(b));
-            if hi - lo < 50.0 {
-                return Err("the band must be at least 50 Hz wide".into());
-            }
-            if !((if audio { 0.0 <= lo } else { -fsd / 2.0 < lo }) && hi < fsd / 2.0) {
-                return Err(format!("the band must lie inside the recording (+-{} Hz)", fmt_f(fsd / 2.0, 0)));
-            }
-            Some((lo, hi))
+    let mut strong = None;
+    if let Some(ab) = auto_band {
+        let re: Vec<f32> = y.iter().map(|v| v.re).collect();
+        let st = strongest_tone(&re, fsd);
+        strong = Some(st);
+        if ab.0 <= st && st <= ab.1 {
+            note(log, "band", format!("the strongest tone {} Hz moves: no band needed (scan)", fmt_f(st, 0)), "  ");
+        } else {
+            band = Some(ab);
+            note(log, "band", format!("band {} to {} Hz around the moving tone; the strongest tone {} Hz is steady (scan)", fmt_f(ab.0, 0), fmt_f(ab.1, 0), fmt_f(st, 0)), "  ");
         }
-        None => None,
-    };
+    }
+    if let Some((lo, hi)) = band {
+        if hi - lo < 50.0 {
+            return Err("the band must be at least 50 Hz wide".into());
+        }
+        if !((if audio { 0.0 <= lo } else { -fsd / 2.0 < lo }) && hi < fsd / 2.0) {
+            return Err(format!("the band must lie inside the recording (+-{} Hz)", fmt_f(fsd / 2.0, 0)));
+        }
+    }
     let y = if let (true, Some(b)) = (audio, band) {
         let (z, c) = band_shift(&y, fsd, b, true);
         tone = c;
@@ -1513,8 +1879,8 @@ pub fn run(path: &Path, o: &TraceOpts, log: &mut dyn FnMut(&str)) -> Result<Trac
     } else if audio {
         let re: Vec<f32> = y.iter().map(|v| v.re).collect();
         drop(y);
-        let (mut a, t) = to_analytic(&re, fsd);
-        tone = t;
+        tone = strong.unwrap_or_else(|| strongest_tone(&re, fsd));
+        let mut a = to_analytic(&re, fsd, tone);
         remove_dc(&mut a, (5.0 * fsd) as usize);
         dc = Some(0.0);
         span = span.min(fsd / 2.0 - 100.0);
@@ -1523,7 +1889,7 @@ pub fn run(path: &Path, o: &TraceOpts, log: &mut dyn FnMut(&str)) -> Result<Trac
     } else {
         let mut y = y;
         remove_dc(&mut y, (5.0 * fsd) as usize);
-        dc = Some(0.0);
+        dc = Some(if shift != 0 { -(shift as f64) } else { 0.0 });
         if let Some(b) = band {
             let (z, c) = band_shift(&y, fsd, b, false);
             tone = c;
@@ -1535,12 +1901,53 @@ pub fn run(path: &Path, o: &TraceOpts, log: &mut dyn FnMut(&str)) -> Result<Trac
             y
         }
     };
-    fc += tone;
-    let tr = if o.burst {
+    fc += tone + shift as f64;
+    let mut burst = o.burst;
+    let tr = if burst {
         log("  burst mode");
         burst_track(&y, fsd, span)?
     } else {
-        track(&y, fsd, span, dc, band.is_some())?
+        let normal = track(&y, fsd, span, dc, band.is_some());
+        // Burst mode is tried when the trace looks like bursts: it covers < 30 %, moves < span/5 or is not a clean pass.
+        let (try_burst, qn) = match &normal {
+            Ok(tr) if !audio => {
+                let f: Vec<f64> = (0..tr.t.len()).filter(|&i| tr.acc[i]).map(|i| tr.lc[i]).collect();
+                let swing = if f.is_empty() { 0.0 } else { f.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b)) - f.iter().fold(f64::INFINITY, |a, &b| a.min(b)) };
+                let cover = f.len() as f64 / tr.ninside.max(1) as f64;
+                let q = pass_quality(tr, tt, span);
+                (swing < 0.2 * span || cover < 0.3 || !q.0, Some(q))
+            }
+            Ok(_) => (false, None),
+            Err(_) => (!audio, None),
+        };
+        if !try_burst {
+            normal?
+        } else {
+            let b = burst_track(&y, fsd, span).ok();
+            let (qb_clean, qb_why, qb_cover) = match &b { Some(b) => pass_quality(b, tt, span), None => (false, "no bursts found".to_string(), 0.0) };
+            match (normal, qn) {
+                (Ok(nt), Some((qn_clean, qn_why, qn_cover))) => {
+                    if qb_clean && (!qn_clean || qb_cover > qn_cover) {
+                        burst = true;
+                        let why = if !qn_clean { format!("normal trace {qn_why}") } else { format!("burst trace {qb_why}, normal trace {}%", fmt_f(100.0 * qn_cover, 0)) };
+                        note(log, "burst", format!("burst mode on (steady lines stronger than the signal: {why})"), "  ");
+                        b.unwrap()
+                    } else {
+                        note(log, "burst", format!("burst mode tried and not used (burst trace {qb_why})"), "  ");
+                        nt
+                    }
+                }
+                (normal, _) => {
+                    let e = normal.err().unwrap_or_else(|| NOT_FOUND.into());
+                    if !qb_clean {
+                        return Err(e);
+                    }
+                    burst = true;
+                    note(log, "burst", "burst mode on (the normal trace found no signal)".into(), "  ");
+                    b.unwrap()
+                }
+            }
+        }
     };
     let points: Vec<TracePoint> = (0..tr.t.len())
         .filter(|&i| tr.acc[i])
@@ -1569,18 +1976,18 @@ pub fn run(path: &Path, o: &TraceOpts, log: &mut dyn FnMut(&str)) -> Result<Trac
         centre_hz: fc,
         audio_tone_hz: audio.then_some(tone),
         band_hz: band,
-        burst: o.burst,
+        burst,
         sample_rate: rate,
         decimated_rate: fsd,
-        duration_s: n as f64 / rate as f64,
-        start_utc: o.start.clone().filter(|s| !s.trim().is_empty()),
+        duration_s: tt,
+        start_utc: start,
         point_noise_hz: py_round(tr.sigma, 2),
         point_noise_pairs: tr.nsigma,
         swing_hz: py_round(swing, 1),
         fixed_receiver_lines_hz: tr.lines.iter().filter(|&&v| dc != Some(v)).map(|&v| py_round(v, 1)).collect(),
-        window: if o.burst { BURST_WINDOW_NOTE } else { WINDOW_NOTE }.into(),
+        window: if burst { BURST_WINDOW_NOTE } else { WINDOW_NOTE }.into(),
         note: None,
-        burst_hint: None,
+        auto,
         waterfall: wf,
     };
     res.write_csv(&res.csv_path)?;
@@ -1601,19 +2008,6 @@ pub fn run(path: &Path, o: &TraceOpts, log: &mut dyn FnMut(&str)) -> Result<Trac
         );
         log(&format!("  NOTE: {note}"));
         res.note = Some(note);
-    }
-    if !audio && !o.burst {
-        let cover = res.points.len() as f64 / tr.ninside.max(1) as f64;
-        if swing < 0.2 * span || cover < 0.3 {
-            let hint = format!(
-                "The trace covers {}% of the recording and moves {} Hz. If the satellite sends short bursts \
-                 (FSK or packets) under steady lines, run again with --burst.",
-                fmt_f(100.0 * cover, 0),
-                fmt_f(swing, 0)
-            );
-            log(&format!("  NOTE: {hint}"));
-            res.burst_hint = Some(hint);
-        }
     }
     Ok(res)
 }
@@ -1676,8 +2070,8 @@ mod tests {
 
     #[test]
     fn iso_time_round_trip() {
-        let s = parse_iso("2026-06-14T18:10:09Z").unwrap();
-        assert_eq!(iso_ms(s, 12.25), "2026-06-14T18:10:21.250+00:00");
+        let s = parse_iso("2026-06-01T12:00:00Z").unwrap();
+        assert_eq!(iso_ms(s, 12.25), "2026-06-01T12:00:12.250+00:00");
         assert_eq!(iso_ms(parse_iso("2026-12-31T23:59:59.9").unwrap(), 0.2), "2027-01-01T00:00:00.100");
         assert_eq!(py_float(437800000.0), "437800000.0");
         assert_eq!(py_float(1e-5), "1e-05");
@@ -1686,7 +2080,7 @@ mod tests {
     #[test]
     fn bad_inputs_do_not_panic() {
         assert!(parse_iso("2026-06-1\u{e9}T00:00:00Z").is_err());
-        assert!(parse_iso("2026-06-14T00\u{e9}00Z").is_err());
+        assert!(parse_iso("2026-06-01T00\u{e9}00Z").is_err());
         assert!(track(&[Complex32::new(0.1, 0.0); 3], 2.0, 15000.0, Some(0.0), false).is_err());
         assert!(track(&[], 48000.0, 15000.0, Some(0.0), false).is_err());
         assert!(burst_track(&[Complex32::new(0.1, 0.0); 3], 2.0, 15000.0).is_err());
@@ -1782,6 +2176,52 @@ mod tests {
         assert!(tr.lines.is_empty() && tr.sigma.is_finite());
     }
 
+    #[test]
+    fn file_time_start_and_name_centre() {
+        // modified 2025-01-02 03:04:05 UTC, 100.4 s long: start 03:02:24.6, shown as 03:02:25
+        let mtime = (days_from_civil(2025, 1, 2) * 86400 + 3 * 3600 + 4 * 60 + 5) as f64;
+        assert_eq!(utc_text(mtime - 100.4), "2025-01-02T03:02:25Z");
+        assert_eq!(utc_text(mtime - 3725.0), "2025-01-02T02:02:00Z");
+        assert_eq!(sdrpp_centre("x_12Hz_437800000Hz_IQ"), Some(437800000.0));
+        assert_eq!(sdrpp_centre("rec_1000Hz"), None);
+        assert_eq!(signed_comma(61000), "+61,000");
+    }
+
+    #[test]
+    fn scan_finds_a_pass_outside_the_default_window() {
+        // 192 kS/s, 120 s: an S-curve centred at +60 kHz swinging +-6 kHz, a steady line at -30 kHz 3 times stronger
+        let fs = 192000.0;
+        let p = [60000.0, 6000.0, 60.0, 15.0];
+        let mut rng = Rng(99);
+        let mut ph = 0.0f64;
+        let w = 2.0 * std::f64::consts::PI;
+        let y: Vec<Complex32> = (0..(fs * 120.0) as usize).map(|i| {
+            let t = i as f64 / fs;
+            ph += pass_model(t, &p) / fs;
+            let v = Complex::<f64>::from_polar(0.05, w * ph) + Complex::from_polar(0.15, w * -30000.0 * t) + Complex::new(0.2 * rng.gauss(), 0.2 * rng.gauss());
+            Complex32::new(v.re as f32, v.im as f32)
+        }).collect();
+        let inp = input::Input::iq_from_memory_for_test(y, fs as u32);
+        let sc = scan_spectra(&inp, false, false).unwrap().expect("spectra");
+        let (lo, hi, _) = scan_iq(&sc, fs).expect("a moving line");
+        assert!((lo - 54500.0).abs() < 800.0 && (hi - 65500.0).abs() < 800.0, "{lo} {hi}");
+        let (shift, span) = span_from_scan(lo, hi);
+        assert_eq!((shift, span), (60000, DEFAULT_SPAN));
+        // the steady line alone does not count as a signal
+        let y: Vec<Complex32> = (0..(fs * 60.0) as usize).map(|i| { let v = Complex::<f64>::from_polar(0.15, w * -30000.0 * i as f64 / fs) + Complex::new(0.2 * rng.gauss(), 0.2 * rng.gauss()); Complex32::new(v.re as f32, v.im as f32) }).collect();
+        let sc = scan_spectra(&input::Input::iq_from_memory_for_test(y, fs as u32), false, false).unwrap().unwrap();
+        assert!(scan_iq(&sc, fs).is_none());
+    }
+
+    #[test]
+    fn strongest_path_only_falls() {
+        let mut v = vec![vec![0.0; 6]; 4];
+        for (k, j) in [(0, 4), (1, 3), (2, 3), (3, 1)] { v[k][j] = 5.0; }
+        v[3][5] = 4.0; // a rise is not allowed
+        assert_eq!(strongest_path(&v, 2), vec![4, 3, 3, 1]);
+        assert_eq!(percentile(&[1.0, 2.0, 3.0, 4.0], 5.0), 1.15);
+    }
+
     /// Parity run on a real file: DOPPLER_PARITY_FILE=... DOPPLER_PARITY_OUT=... cargo test --release -- --ignored parity
     #[test]
     #[ignore]
@@ -1792,7 +2232,7 @@ mod tests {
             start: std::env::var("DOPPLER_PARITY_START").ok(),
             center: std::env::var("DOPPLER_PARITY_CENTER").ok().map(|v| v.parse().unwrap()),
             rate: std::env::var("DOPPLER_PARITY_RATE").ok().map(|v| v.parse().unwrap()),
-            format: std::env::var("DOPPLER_PARITY_FORMAT").map(|v| v.parse().unwrap()).unwrap_or_default(),
+            format: std::env::var("DOPPLER_PARITY_FORMAT").ok().map(|v| v.parse().unwrap()),
             swap_iq: std::env::var("DOPPLER_PARITY_SWAP").is_ok(),
             band: std::env::var("DOPPLER_PARITY_BAND").ok().map(|v| {
                 let (a, b) = v.split_once(',').unwrap();

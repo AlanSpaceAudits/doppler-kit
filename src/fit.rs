@@ -33,7 +33,7 @@ pub struct MethodD {
 }
 
 #[derive(Clone, Debug)]
-pub struct PathTest { pub bending: bool, pub p_value: f64, pub pattern_rms_hz: f64, pub scatter_rms_hz: f64 }
+pub struct PathTest { pub bending: bool, pub p_value: f64, pub pattern_rms_hz: f64, pub scatter_rms_hz: f64, pub detectable_rms_hz: f64 }
 
 #[derive(Clone, Debug)]
 pub struct Marks {
@@ -144,8 +144,8 @@ pub fn polyfit_eval(x: &[f64], y: &[f64], k: usize) -> Vec<f64> {
     }
 }
 
-/// Straight or bending path: F-test of a degree-k polynomial through the leftover,
-/// with n_eff = n / indep independent points; p < 0.001 = bending.
+/// Bending path or not: F-test of a degree-k polynomial through the leftover,
+/// with n_eff = n / indep independent points; p < 0.001 = bending, otherwise no bending detected.
 pub fn straightness(t: &[f64], left: &[f64], indep: f64, k: usize) -> PathTest {
     let (mt, ptp) = (mean(t), t.iter().cloned().fold(f64::NEG_INFINITY, f64::max) - t.iter().cloned().fold(f64::INFINITY, f64::min));
     let x: Vec<f64> = t.iter().map(|v| (v - mt) / ptp).collect();
@@ -157,11 +157,36 @@ pub fn straightness(t: &[f64], left: &[f64], indep: f64, k: usize) -> PathTest {
     let d2 = (n - k as f64 - 1.0).max(1.0);
     let ff = ((rss0 - rss1) / (k as f64 + 1.0)) / (rss1 / d2);
     let p = f_sf(ff, k as f64 + 1.0, d2);
+    let scatter = (rss1 / t.len() as f64).sqrt();
+    // Detection limit. N = number of points, A = pattern rms, s = scatter rms, d1 = k + 1.
+    //   the polynomial is a least-squares projection, so rss0 - rss1 = sum(smooth^2) = N A^2
+    //   rss1 = N s^2
+    //   F = (N A^2 / d1) / (N s^2 / d2)
+    //   F = (A^2 / s^2) (d2 / d1)
+    //   bending when F >= F_crit, the 0.999 quantile of F(d1, d2)
+    //   A^2 = s^2 F_crit d1 / d2
+    //   A_min = s sqrt(F_crit d1 / d2)
+    let d1 = k as f64 + 1.0;
+    let detectable = scatter * (f_isf(0.001, d1, d2) * d1 / d2).sqrt();
     PathTest {
         bending: p < 0.001, p_value: p,
         pattern_rms_hz: (sq(smooth) / t.len() as f64).sqrt(),
-        scatter_rms_hz: (rss1 / t.len() as f64).sqrt(),
+        scatter_rms_hz: scatter,
+        detectable_rms_hz: detectable,
     }
+}
+
+/// F with f_sf(F, d1, d2) = q (the 1 - q quantile), by bisection on the survival function.
+pub fn f_isf(q: f64, d1: f64, d2: f64) -> f64 {
+    let mut hi = 1.0;
+    while f_sf(hi, d1, d2) > q && hi < 1e300 { hi *= 2.0; }
+    let mut lo = 0.0;
+    for _ in 0..200 {
+        let mid = 0.5 * (lo + hi);
+        if mid <= lo || mid >= hi { break; }
+        if f_sf(mid, d1, d2) > q { lo = mid } else { hi = mid }
+    }
+    0.5 * (lo + hi)
 }
 
 /// ln Gamma(x), Lanczos g=7, n=9.
@@ -338,7 +363,8 @@ impl FitResult {
             ("method_A", J::O(vec![("v", J::F(a.v)), ("f0", J::F(a.f0)), ("t0", J::F(a.t0)), ("d", J::F(a.d)), ("dt", J::F(a.dt))])),
             ("method_D", J::O(dd)),
             ("path", J::O(vec![("path", J::S(self.path_word().into())), ("p_value", J::F(s.p_value)),
-                ("pattern_rms_Hz", J::F(s.pattern_rms_hz)), ("scatter_rms_Hz", J::F(s.scatter_rms_hz))])),
+                ("pattern_rms_Hz", J::F(s.pattern_rms_hz)), ("scatter_rms_Hz", J::F(s.scatter_rms_hz)),
+                ("detectable_rms_Hz", J::F(s.detectable_rms_hz))])),
             ("marks", J::O(vec![
                 ("f_plus_Hz", J::F(m.f_plus_hz)), ("f_minus_Hz", J::F(m.f_minus_hz)),
                 ("half_plateau_Hz", J::A(m.half_plateau_hz.to_vec())), ("half_plateau_t_s", J::A(m.half_plateau_t_s.to_vec())),
@@ -351,17 +377,17 @@ impl FitResult {
         s
     }
 
-    pub fn path_word(&self) -> &'static str { if self.path.bending { "bending" } else { "straight" } }
+    pub fn path_word(&self) -> &'static str { if self.path.bending { "bending" } else { "no bending detected" } }
 
     /// The three lines fit_pass.py prints.
     pub fn log_text(&self) -> String {
         let (a, d, s) = (&self.a, &self.d, &self.path);
         format!(
-            "A (plateaus): v {} km/s, d {} km, f0 {} Hz\nD (full fit): v {} ± {} km/s, d {} ± {} km, t0 {} s, f0 {} Hz, left over {} Hz rms over {} points\nPath: {} (smooth pattern {} Hz rms against scatter {} Hz, p = {})\n",
+            "A (plateaus): v {} km/s, d {} km, f0 {} Hz\nD (full fit): v {} ± {} km/s, d {} ± {} km, t0 {} s, f0 {} Hz, left over {} Hz rms over {} points\nPath: {} (smooth pattern {} Hz rms against scatter {} Hz, p = {}; detectable from {} Hz rms)\n",
             fx(a.v / 1e3, 3), fx(a.d / 1e3, 1), fx(a.f0, 1),
             fx(d.v_m_s / 1e3, 3), fx(self.err("v_m_s") / 1e3, 3), fx(d.d_m / 1e3, 1), fx(self.err("d_m") / 1e3, 1),
             fx(d.t0_s, 2), fx(d.f0_hz, 1), fx(d.rms_hz, 1), d.n,
-            self.path_word(), fx(s.pattern_rms_hz, 1), fx(s.scatter_rms_hz, 1), fg(s.p_value, 2),
+            self.path_word(), fx(s.pattern_rms_hz, 1), fx(s.scatter_rms_hz, 1), fg(s.p_value, 2), fx(s.detectable_rms_hz, 1),
         )
     }
 
@@ -396,7 +422,8 @@ impl FitResult {
             "PATH".into(),
             format!("  {}: smooth pattern left by the fit {} Hz rms against scatter {} Hz rms (p = {})",
                 self.path_word().to_uppercase(), fx(s.pattern_rms_hz, 1), fx(s.scatter_rms_hz, 1), fg(s.p_value, 2)),
-            "  A straight path leaves only scatter. A bending path leaves a smooth wave (p below 0.001).".into(),
+            format!("  This recording can detect a smooth pattern of {} Hz rms or more (p below 0.001).", fx(s.detectable_rms_hz, 1)),
+            "  A straight path leaves only scatter. A bending path leaves a smooth wave.".into(),
         ]
     }
 }
@@ -581,6 +608,7 @@ mod tests {
         assert!((r.d.d_m - 420e3).abs() < 1e3, "d {}", r.d.d_m);
         assert!((r.d.t0_s - 300.0).abs() < 0.1 && (r.d.f0_hz - 137.5e6).abs() < 2.0);
         assert!(!r.path.bending, "p {}", r.path.p_value);
+        assert_eq!(r.path_word(), "no bending detected");
         assert!(r.err("v_m_s") > 0.0 && r.marks.dt_s > 0.0);
         assert!(r.to_json().contains("\"method_D\""));
     }
@@ -590,6 +618,7 @@ mod tests {
         let (t, f) = synth(7400.0, 500e3, 137.5e6, 20.0, true);
         let r = run(&t, &f, None, C_LIGHT, None, 0.0).unwrap();
         assert!(r.path.bending, "p {}", r.path.p_value);
+        assert_eq!(r.path_word(), "bending");
     }
 
     #[test]
@@ -607,6 +636,15 @@ mod tests {
             (25.0, 7.0, 3593.0, 1.5522852429577195e-33), (0.5, 3.0, 10.0, 0.6906222455335574), (10.0, 7.0, 890.25, 4.565844331740496e-12)] {
             let got = f_sf(f, a, b);
             assert!(((got - want) / want).abs() < 1e-9, "{f} {a} {b}: {got} vs {want}");
+        }
+    }
+
+    #[test]
+    fn f_quantile_inverts_survival() {
+        // scipy.stats.f.ppf(0.999, d1, d2)
+        for (d1, d2, want) in [(7.0, 100.0, 3.8286209774499786), (7.0, 50.5, 4.214139772585483), (7.0, 3593.0, 3.483911393601435)] {
+            let got = f_isf(0.001, d1, d2);
+            assert!(((got - want) / want).abs() < 1e-6, "{d1} {d2}: {got} vs {want}");
         }
     }
 
