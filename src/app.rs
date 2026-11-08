@@ -46,6 +46,7 @@ struct App {
     log: String, results: String, tab: Tab, rx: Option<Receiver<Msg>>,
     trace: Option<trace::TraceResult>, fit: Option<(fit::FitResult, PathBuf)>, laser: Option<(slr::SlrRun, String)>,
     wf_tex: Option<TextureHandle>,
+    picker: Option<Receiver<(bool, PathBuf)>>,
 }
 
 impl Default for App {
@@ -54,7 +55,7 @@ impl Default for App {
             file: String::new(), centre: String::new(), start: String::new(), wave: Wave::Radio, c_other: String::new(),
             f0: String::new(), span: "15000".into(), rate: String::new(), fmt: RawFormat::Cs16, swap: false, which: "0".into(),
             out: String::new(), log: String::new(), results: String::new(), tab: Tab::Results, rx: None,
-            trace: None, fit: None, laser: None, wf_tex: None,
+            trace: None, fit: None, laser: None, wf_tex: None, picker: None,
         }
     }
 }
@@ -245,21 +246,30 @@ impl App {
         }
     }
 
+    /// File dialogs run on their own thread so the window keeps drawing while one is open.
+    fn pick(&mut self, folder: bool) {
+        if self.picker.is_some() { return; }
+        let (tx, rx) = channel();
+        self.picker = Some(rx);
+        std::thread::spawn(move || {
+            let d = rfd::FileDialog::new();
+            let p = if folder { d.pick_folder() } else {
+                d.add_filter("Recordings", &["wav", "raw", "cs16", "cf32", "cu8", "sigmf-data", "ogg", "oga", "mp3", "flac", "m4a", "opus", "aac"])
+                    .add_filter("Laser ranging", &["np2", "npt", "crd", "html", "htm"])
+                    .add_filter("All files", &["*"])
+                    .pick_file()
+            };
+            if let Some(p) = p { let _ = tx.send((folder, p)); }
+        });
+    }
+
     fn controls(&mut self, ui: &mut egui::Ui) {
         egui::Grid::new("controls").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
             ui.label("Recording");
             ui.horizontal(|ui| {
                 ui.add(egui::TextEdit::singleline(&mut self.file).desired_width(250.0));
                 if ui.button("Browse…").clicked() {
-                    let p = rfd::FileDialog::new()
-                        .add_filter("Recordings", &["wav", "raw", "cs16", "cf32", "cu8", "sigmf-data", "ogg", "oga", "mp3", "flac", "m4a", "opus", "aac"])
-                        .add_filter("Laser ranging", &["np2", "npt", "crd", "html", "htm"])
-                        .add_filter("All files", &["*"])
-                        .pick_file();
-                    if let Some(p) = p {
-                        if let Some(c) = p.file_name().and_then(|n| centre_from_name(&n.to_string_lossy())) { self.centre = c; }
-                        self.file = p.display().to_string();
-                    }
+                    self.pick(false);
                 }
             });
             ui.end_row();
@@ -291,7 +301,7 @@ impl App {
             ui.horizontal(|ui| {
                 ui.add(egui::TextEdit::singleline(&mut self.out).desired_width(250.0));
                 if ui.button("…").clicked() {
-                    if let Some(p) = rfd::FileDialog::new().pick_folder() { self.out = p.display().to_string(); }
+                    self.pick(true);
                 }
             });
             ui.end_row();
@@ -465,6 +475,18 @@ impl App {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll();
+        if let Some(rx) = &self.picker {
+            match rx.try_recv() {
+                Ok((true, p)) => { self.out = p.display().to_string(); self.picker = None; }
+                Ok((false, p)) => {
+                    if let Some(c) = p.file_name().and_then(|n| centre_from_name(&n.to_string_lossy())) { self.centre = c; }
+                    self.file = p.display().to_string();
+                    self.picker = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.picker = None,
+                Err(_) => ui.ctx().request_repaint_after(std::time::Duration::from_millis(100)),
+            }
+        }
         egui::Panel::left("controls").resizable(true).default_size(470.0).show(ui, |ui| {
             ui.add_space(6.0);
             self.controls(ui);
