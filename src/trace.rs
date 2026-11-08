@@ -30,8 +30,17 @@ const SEARCH_C: f64 = 100.0;
 const SEARCH_D: f64 = 150.0;
 const SPUR_HALF: f64 = 40.0;
 const CLIP_K: f64 = 4.0;
+const BURST_FRAME_S: f64 = 0.5;
+const BURST_SMOOTH_HZ: f64 = 100.0;
+const BURST_MEDIAN_S: f64 = 20.0;
+const BURST_BAND_HZ: f64 = 2000.0;
+const BURST_THR_DB: f64 = 6.0;
+const BURST_FSCALE_HZ: f64 = 300.0;
+const BURST_GATE_HZ: f64 = 800.0;
 pub const NOT_FOUND: &str = "signal not found: check --center, --span and --swap-iq";
 pub const WINDOW_NOTE: &str = "1.0 s Hann, 0.25 s hop (only every 4th point is independent)";
+pub const BURST_WINDOW_NOTE: &str = "0.5 s Hann frames, no overlap";
+pub const NO_BURSTS: &str = "no bursts found: check --center, --span and --band";
 
 #[derive(Clone, Debug)]
 pub struct TraceOpts {
@@ -42,11 +51,15 @@ pub struct TraceOpts {
     pub format: RawFormat,
     pub swap_iq: bool,
     pub out: Option<PathBuf>,
+    /// Tone band (lo, hi) in Hz: audio frequencies for audio, offsets from the centre for IQ.
+    pub band: Option<(f64, f64)>,
+    /// Short-burst mode (FSK/packet satellites).
+    pub burst: bool,
 }
 
 impl Default for TraceOpts {
     fn default() -> Self {
-        Self { center: None, start: None, span: 15000.0, rate: None, format: RawFormat::Cs16, swap_iq: false, out: None }
+        Self { center: None, start: None, span: 15000.0, rate: None, format: RawFormat::Cs16, swap_iq: false, out: None, band: None, burst: false }
     }
 }
 
@@ -74,6 +87,8 @@ pub struct TraceResult {
     pub points: Vec<TracePoint>,
     pub centre_hz: f64,
     pub audio_tone_hz: Option<f64>,
+    pub band_hz: Option<(f64, f64)>,
+    pub burst: bool,
     pub sample_rate: u32,
     pub decimated_rate: f64,
     pub duration_s: f64,
@@ -84,6 +99,8 @@ pub struct TraceResult {
     pub fixed_receiver_lines_hz: Vec<f64>,
     pub window: String,
     pub note: Option<String>,
+    /// Suggests --burst when an IQ trace covers little of the recording or hardly moves (not in the JSON file).
+    pub burst_hint: Option<String>,
     pub waterfall: Waterfall,
     pub csv_path: PathBuf,
     pub summary_path: PathBuf,
@@ -327,7 +344,7 @@ fn normalise(rows: &mut [Vec<f32>]) {
     }
 }
 
-/// Receiver spurs: bins whose time-median power stands > 6 dB over the local floor. Always includes 0 Hz.
+/// Receiver spurs: bins whose time-median power stands > 6 dB over the local floor.
 fn fixed_lines(f: &[f64], rows: &[Vec<f32>]) -> Vec<f64> {
     let nf = f.len();
     // numpy keeps float32 P in float32 through median, log10 and the 6 dB test
@@ -355,7 +372,6 @@ fn fixed_lines(f: &[f64], rows: &[Vec<f32>]) -> Vec<f64> {
     if !grp.is_empty() {
         lines.push(grp.iter().map(|&g| f[g]).sum::<f64>() / grp.len() as f64);
     }
-    lines.push(0.0);
     lines
 }
 
@@ -720,9 +736,13 @@ fn fit_model(t: &[f64], f: &[f64], span: f64) -> [f64; 4] {
     let (tmin, tmax) = (t[0].min(t[t.len() - 1]), t[0].max(t[t.len() - 1]));
     let lo = [-span, 10.0, tmin - 300.0, 2.0];
     let hi = [span, 2.0 * span, tmax + 300.0, 2000.0];
+    soft_l1_fit(t, f, [med.clamp(-span * 0.9, span * 0.9), ((fmax - fmin) / 2.0).max(100.0), tm, 60.0], lo, hi, 200.0).0
+}
+
+/// Bounded soft_l1 fit of the S-curve (scale `C` Hz) from `p0`. Returns the parameters and the summed soft_l1 cost.
+fn soft_l1_fit(t: &[f64], f: &[f64], p0: [f64; 4], lo: [f64; 4], hi: [f64; 4], #[allow(non_snake_case)] C: f64) -> ([f64; 4], f64) {
     let clampp = |p: [f64; 4]| -> [f64; 4] { std::array::from_fn(|i| p[i].clamp(lo[i], hi[i])) };
-    let mut p = clampp([med.clamp(-span * 0.9, span * 0.9), ((fmax - fmin) / 2.0).max(100.0), tm, 60.0]);
-    const C: f64 = 200.0;
+    let mut p = clampp(p0);
     let cost = |p: &[f64; 4]| -> f64 {
         t.iter().zip(f).map(|(&x, &y)| {
             let z = ((pass_model(x, p) - y) / C).powi(2);
@@ -783,18 +803,47 @@ fn fit_model(t: &[f64], f: &[f64], span: f64) -> [f64; 4] {
             break;
         }
     }
-    p
+    (p, c0)
+}
+
+/// Soft-L1 fit of the pass shape from 15 x 3 starts (t0 across the trace, width T/30, T/10, T/3); the lowest cost wins.
+fn robust_pass(t: &[f64], f: &[f64], tt: f64, span: f64) -> [f64; 4] {
+    let (tmin, tmax) = t.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), &v| (a.min(v), b.max(v)));
+    let (fmin, fmax) = f.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), &v| (a.min(v), b.max(v)));
+    let med = median_of(f.iter().copied());
+    let lo = [-span, 10.0, tmin - tt, 0.5];
+    let hi = [span, 2.0 * span, tmax + tt, 10.0 * tt];
+    let step = (tmax - tmin) / 14.0;
+    let mut best: Option<([f64; 4], f64)> = None;
+    for k in 0..15 {
+        let t0 = if k == 14 { tmax } else { k as f64 * step + tmin }; // numpy linspace
+        for w in [tt / 30.0, tt / 10.0, tt / 3.0] {
+            let r = soft_l1_fit(t, f, [med, ((fmax - fmin) / 2.0).max(100.0), t0, w.max(1.0)], lo, hi, BURST_FSCALE_HZ);
+            if best.is_none_or(|b| r.1 < b.1) {
+                best = Some(r);
+            }
+        }
+    }
+    best.map(|b| b.0).unwrap_or([0.0; 4])
 }
 
 // ---------- tracking ----------
-fn pass_a(y: &[Complex32], fsd: f64, tt: f64, span: f64) -> Result<([f64; 4], Vec<f64>), String> {
-    let win = (fsd / 4.0).round() as usize;
+/// dc: offset of the receiver DC line (blanked with the fixed lines), or None (audio with a band: no lines at all).
+fn pass_a(y: &[Complex32], fsd: f64, tt: f64, span: f64, dc: Option<f64>) -> Result<([f64; 4], Vec<f64>), String> {
+    let win = (fsd / 4.0).round_ties_even() as usize;
     let (gr, mut rows) = stft(y, fsd, win, win / 2, span, |_, r| r.to_vec()); // 4 Hz grid
     if rows.len() < 5 || gr.f.len() < 3 {
         return Err(NOT_FOUND.into());
     }
     let (t, f) = (&gr.t, &gr.f);
-    let lines = fixed_lines(f, &rows);
+    let lines = match dc {
+        Some(d) => {
+            let mut l = fixed_lines(f, &rows);
+            l.push(d);
+            l
+        }
+        None => Vec::new(),
+    };
     normalise(&mut rows);
     let masked: Vec<bool> = f.iter().map(|&v| near(v, &lines)).collect();
     for r in rows.iter_mut() {
@@ -806,7 +855,7 @@ fn pass_a(y: &[Complex32], fsd: f64, tt: f64, span: f64) -> Result<([f64; 4], Ve
     }
     let df = f[1] - f[0];
     let inside: Vec<bool> = t.iter().map(|&x| x > EDGE_S && x < tt - EDGE_S).collect();
-    let size = 3usize.max((300.0 / df) as usize);
+    let size = 3usize.max((300f64.min(span / 2.0) / df) as usize); // narrower in a narrow band
     let coarse: Vec<(f64, f64)> = par_map(rows.len(), |i| {
         let rs = uniform_filter_reflect(&rows[i], size);
         let ci = argmax(&rs);
@@ -846,7 +895,9 @@ struct Pass {
     inside: Vec<bool>,
 }
 
-fn dechirp_pass(y: &[Complex32], fsd: f64, tt: f64, rf: &(dyn Fn(f64) -> f64 + Sync), search: f64, span: f64) -> Pass {
+/// cut: the signal was cut to +-span (--band). Bins whose source frequency (bin + reference) lies outside the band
+/// are set to 0, the frame floor is the median of the other bins, and there is no per-bin floor.
+fn dechirp_pass(y: &[Complex32], fsd: f64, tt: f64, rf: &(dyn Fn(f64) -> f64 + Sync), search: f64, span: f64, cut: bool) -> Pass {
     let mut acc = 0.0f64;
     let tau = 2.0 * std::f64::consts::PI;
     let z: Vec<Complex32> = y
@@ -859,7 +910,7 @@ fn dechirp_pass(y: &[Complex32], fsd: f64, tt: f64, rf: &(dyn Fn(f64) -> f64 + S
             Complex32::new((re * c - im * s) as f32, (re * s + im * c) as f32)
         })
         .collect();
-    let win = fsd.round() as usize;
+    let win = fsd.round_ties_even() as usize;
     let val = 1.0 / (win as f64 * (1.0 / fsd));
     let fall = |k: usize| (k as i64 - (win / 2) as i64) as f64 * val;
     let k_lo = (0..win).find(|&k| fall(k).abs() <= span).unwrap_or(0);
@@ -867,14 +918,28 @@ fn dechirp_pass(y: &[Complex32], fsd: f64, tt: f64, rf: &(dyn Fn(f64) -> f64 + S
     let fk: Vec<f64> = (k_lo..k_lo + nk).map(fall).collect();
     let (j0, j1) = (searchsorted(&fk, -search), searchsorted(&fk, search));
     let (b0, b1) = (j0.saturating_sub(1), (j1 + 1).min(nk)); // stored band, with one guard bin each side
-    let (gr, rows) = stft(&z, fsd, win, win / 4, span, |_, r| {
-        let m = median_of(r.iter().map(|&v| v as f64)) as f32;
-        (m, r[b0..b1].to_vec())
+    let hop = win / 4;
+    let (gr, rows) = stft(&z, fsd, win, hop, span, |i, r| {
+        if !cut {
+            let m = median_of(r.iter().map(|&v| v as f64)) as f32;
+            return (m, r[b0..b1].to_vec());
+        }
+        let fref = rf((i as f64 * hop as f64 + win as f64 / 2.0) / fsd);
+        let out = |k: usize| (fk[k] + fref).abs() > span;
+        let mut kept: Vec<f64> = (0..r.len()).filter(|&k| !out(k)).map(|k| r[k] as f64).collect();
+        let m = if kept.is_empty() { f32::INFINITY } else { median(&mut kept) as f32 };
+        (m, (b0..b1).map(|k| if out(k) { 0.0 } else { r[k] }).collect())
     });
     drop(z);
     let f = &gr.f;
     let df = f[1] - f[0];
-    let nbin: Vec<f32> = (j0..j1).map(|j| median_of(rows.iter().map(|(m, r)| (r[j - b0] / m) as f64)) as f32).collect();
+    let nbin: Vec<f32> = if cut {
+        vec![1.0; j1 - j0]
+    } else {
+        (j0..j1).map(|j| median_of(rows.iter().map(|(m, r)| (r[j - b0] / m) as f64)) as f32).collect()
+    };
+    // numpy: one infinite frame floor turns the floor array into float64
+    let med64 = rows.iter().any(|(m, _)| m.is_infinite());
     let n = gr.t.len();
     let (mut pk, mut snr, mut lc) = (vec![f64::NAN; n], vec![f64::NAN; n], vec![f64::NAN; n]);
     for (i, (m, r)) in rows.iter().enumerate() {
@@ -884,6 +949,17 @@ fn dechirp_pass(y: &[Complex32], fsd: f64, tt: f64, rf: &(dyn Fn(f64) -> f64 + S
         let jl = j - b0;
         let pi = if jl >= 1 && jl + 1 < r.len() { peak_interp(&r[jl - 1..jl + 2], 1) } else { 0.0 };
         pk[i] = fref + f[j] + pi * df;
+        if cut {
+            // float64 here: med * nbin (float64 ones) promotes
+            snr[i] = if med64 { 10.0 * (r[jl] as f64 / *m as f64).log10() } else { (10.0 * (r[jl] / m).log10()) as f64 };
+            let e: Vec<f64> = band.iter().map(|&p| (p as f64 - *m as f64).max(0.0)).collect();
+            let se = crate::lm::np_sum(&e);
+            if se > 0.0 {
+                let ef: Vec<f64> = e.iter().zip(&f[j0..j1]).map(|(&v, &x)| v * x).collect();
+                lc[i] = fref + crate::lm::np_sum(&ef) / se;
+            }
+            continue;
+        }
         snr[i] = (10.0 * (r[jl] / m).log10()) as f64;
         let e: Vec<f32> = band.iter().zip(&nbin).map(|(&p, &nb)| (p - m * nb).max(0.0)).collect();
         let se = crate::lm::np_sum(&e);
@@ -920,21 +996,22 @@ pub struct Track {
     pub sigma: f64,
     pub nsigma: usize,
     pub lines: Vec<f64>,
-    pub y_dc: Vec<Complex32>,
+    /// Frames of the last measuring pass clear of the recording edges.
+    pub ninside: usize,
 }
 
 /// Track the carrier in a complex baseband signal at `fsd` S/s (offsets from 0 Hz within +-span).
-pub fn track(mut y: Vec<Complex32>, fsd: f64, span: f64) -> Result<Track, String> {
+/// dc: offset of the receiver DC line (blanked), or None for audio with a band. cut: the signal was cut to +-span.
+pub fn track(y: &[Complex32], fsd: f64, span: f64, dc: Option<f64>, cut: bool) -> Result<Track, String> {
     let tt = y.len() as f64 / fsd;
-    remove_dc(&mut y, (5.0 * fsd) as usize);
-    let (pa, lines) = pass_a(&y, fsd, tt, span)?;
+    let (pa, lines) = pass_a(y, fsd, tt, span, dc)?;
     let det_of = |d: &Pass, lc: bool| -> Vec<bool> {
         (0..d.t.len())
             .map(|i| d.snr[i] > C_THR_DB && d.inside[i] && !near(d.pk[i], &lines) && (!lc || d.lc[i].is_finite()))
             .collect()
     };
     let err = |_| NOT_FOUND.to_string();
-    let d = dechirp_pass(&y, fsd, tt, &|x| pass_model(x, &pa), SEARCH_B, span);
+    let d = dechirp_pass(y, fsd, tt, &|x| pass_model(x, &pa), SEARCH_B, span, cut);
     let det = det_of(&d, false);
     let (td, pd) = (select(&d.t, &det), select(&d.pk, &det));
     let (_, ok) = robust_spline(&td, &pd, CLIP_K, None).map_err(err)?;
@@ -958,7 +1035,7 @@ pub fn track(mut y: Vec<Complex32>, fsd: f64, span: f64) -> Result<Track, String
         return Err(NOT_FOUND.into());
     }
     let ref_c = |x: f64| pass_model(x, &pb) + interp(x, &cx, &cy);
-    let d = dechirp_pass(&y, fsd, tt, &ref_c, SEARCH_C, span);
+    let d = dechirp_pass(y, fsd, tt, &ref_c, SEARCH_C, span, cut);
     let det = det_of(&d, false);
     let (td, pd) = (select(&d.t, &det), select(&d.pk, &det));
     let (_, ok0) = robust_spline(&td, &pd, CLIP_K, None).map_err(err)?;
@@ -970,7 +1047,7 @@ pub fn track(mut y: Vec<Complex32>, fsd: f64, span: f64) -> Result<Track, String
         let xc = x.clamp(c0, c1);
         ref_c(x) + sp.eval(xc) - ref_c(xc)
     };
-    let d = dechirp_pass(&y, fsd, tt, &ref_d, SEARCH_D, span);
+    let d = dechirp_pass(y, fsd, tt, &ref_d, SEARCH_D, span, cut);
     let det = det_of(&d, true);
     let (td, ld) = (select(&d.t, &det), select(&d.lc, &det));
     let (_, ok0) = robust_spline(&td, &ld, CLIP_K, None).map_err(err)?;
@@ -980,11 +1057,114 @@ pub fn track(mut y: Vec<Complex32>, fsd: f64, span: f64) -> Result<Track, String
     for (q, i) in (0..d.t.len()).filter(|&i| det[i]).enumerate() {
         acc[i] = ok[q];
     }
-    Ok(Track { t: d.t, lc: d.lc, snr: d.snr, acc, sigma: sig, nsigma: nsig, lines, y_dc: y })
+    let ninside = d.inside.iter().filter(|&&v| v).count();
+    Ok(Track { t: d.t, lc: d.lc, snr: d.snr, acc, sigma: sig, nsigma: nsig, lines, ninside })
+}
+
+/// Running median over `2 * half + 1` samples, edges repeated (scipy median_filter, mode "nearest").
+fn running_median(x: &[f32], half: usize) -> Vec<f32> {
+    let n = x.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let at = |i: i64| x[i.clamp(0, n as i64 - 1) as usize];
+    let h = half as i64;
+    let mut win: Vec<f32> = (-h..=h).map(at).collect();
+    win.sort_by(|a, b| a.total_cmp(b));
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n as i64 {
+        out.push(win[half]);
+        let old = at(i - h);
+        let p = win.partition_point(|v| v.total_cmp(&old).is_lt());
+        win.remove(p);
+        let new = at(i + h + 1);
+        let q = win.partition_point(|v| v.total_cmp(&new).is_lt());
+        win.insert(q, new);
+    }
+    out
+}
+
+/// Burst mode: 0.5 s Hann frames, 100 Hz boxcar across frequency, each bin over its running median of +-20 s,
+/// excess E = ratio - 1. Strongest 2000 Hz band of E per frame, kept at >= 6 dB; value = centroid of max(E, 0)
+/// in that band. Outliers: soft-L1 pass fit from a grid of starts, points more than 800 Hz off it dropped.
+pub fn burst_track(y: &[Complex32], fsd: f64, span: f64) -> Result<Track, String> {
+    let tt = y.len() as f64 / fsd;
+    let win = (BURST_FRAME_S * fsd) as usize;
+    let (gr, mut s) = stft(y, fsd, win, win, span, |_, r| r.to_vec());
+    let nf = gr.f.len();
+    if s.len() < 2 || nf < 2 {
+        return Err(NO_BURSTS.into());
+    }
+    let (t, f) = (&gr.t, &gr.f);
+    let df = f[1] - f[0];
+    let smooth = 1usize.max((BURST_SMOOTH_HZ / df) as usize);
+    s = par_map(s.len(), |i| uniform_filter_reflect(&s[i], smooth));
+    let half = (BURST_MEDIAN_S / BURST_FRAME_S) as usize;
+    let cols: Vec<Vec<f32>> = par_map(nf, |j| running_median(&s.iter().map(|r| r[j]).collect::<Vec<_>>(), half));
+    let e: Vec<Vec<f32>> = (0..s.len()).map(|i| (0..nf).map(|j| s[i][j] / (cols[j][i] + 1e-30f32) - 1.0).collect()).collect();
+    drop(cols);
+    drop(s);
+    let nb = 1usize.max((BURST_BAND_HZ / df) as usize);
+    let rows: Vec<(f64, f64)> = par_map(e.len(), |i| {
+        let b = uniform_filter_reflect(&e[i], nb);
+        let j = argmax(&b);
+        // numpy: max(B, 1e-6) keeps the float32 value when it is the larger, else a Python float
+        let snr = if b[j] as f64 >= 1e-6 { (10.0 * (b[j] + 1.0).log10()) as f64 } else { 10.0 * (1e-6f64 + 1.0).log10() };
+        let (lo, hi) = (j.saturating_sub(nb / 2), nf.min(j + nb / 2 + 1));
+        let ev: Vec<f32> = e[i][lo..hi].iter().map(|&v| v.max(0.0)).collect();
+        let se = crate::lm::np_sum(&ev);
+        let mut lc = f64::NAN;
+        if snr >= BURST_THR_DB && se > 0.0 {
+            let ef: Vec<f64> = ev.iter().zip(&f[lo..hi]).map(|(&v, &x)| v as f64 * x).collect();
+            lc = crate::lm::np_sum(&ef) / se as f64;
+        }
+        (snr, lc)
+    });
+    let (snr, lc): (Vec<f64>, Vec<f64>) = rows.into_iter().unzip();
+    let det: Vec<bool> = lc.iter().map(|v| v.is_finite()).collect();
+    if det.iter().filter(|&&v| v).count() <= 10 {
+        return Err(NO_BURSTS.into());
+    }
+    let (td, ld) = (select(t, &det), select(&lc, &det));
+    let p = robust_pass(&td, &ld, tt, span);
+    let acc: Vec<bool> = (0..t.len()).map(|i| det[i] && (lc[i] - pass_model(t[i], &p)).abs() < BURST_GATE_HZ).collect();
+    let r: Vec<f64> = (0..t.len()).filter(|&i| acc[i]).map(|i| lc[i] - pass_model(t[i], &p)).collect();
+    let nsig = r.len();
+    Ok(Track { t: gr.t.clone(), lc, snr, acc, sigma: mad(&r), nsigma: nsig, lines: Vec::new(), ninside: 0 })
+}
+
+/// Zero everything outside lo..hi in one FFT of the whole signal (audio: also the negative frequencies, x2 keeps
+/// the amplitude) and move the band centre to 0 Hz. Returns the signal and the centre (Hz). The cut comes first:
+/// the dechirp passes shift the spectrum by up to the swing and would pull outside sound into the search window.
+pub fn band_shift(y: &[Complex32], fsd: f64, band: (f64, f64), audio: bool) -> (Vec<Complex32>, f64) {
+    let n = y.len();
+    let mut a: Vec<Complex<f64>> = y.iter().map(|v| Complex::new(v.re as f64, v.im as f64)).collect();
+    let mut planner = FftPlanner::<f64>::new();
+    planner.plan_fft_forward(n).process(&mut a);
+    let val = 1.0 / (n as f64 * (1.0 / fsd)); // numpy fftfreq
+    let gain = if audio { 2.0 } else { 1.0 };
+    for (k, v) in a.iter_mut().enumerate() {
+        let fk = if k < n.div_ceil(2) { k as f64 } else { k as f64 - n as f64 } * val;
+        *v *= if fk >= band.0 && fk <= band.1 { gain } else { 0.0 };
+    }
+    planner.plan_fft_inverse(n).process(&mut a);
+    let c = (band.0 + band.1) / 2.0;
+    let (inv, w, rf) = (1.0 / n as f64, -2.0 * std::f64::consts::PI * c, 1.0 / fsd);
+    let z = a
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            // numpy: (-2j pi c k) / fsd is a complex division, i.e. times 1/fsd
+            let (s, co) = ((w * i as f64) * rf).sin_cos();
+            let (re, im) = (v.re * inv, v.im * inv);
+            Complex32::new((re * co - im * s) as f32, (re * s + im * co) as f32)
+        })
+        .collect();
+    (z, c)
 }
 
 fn waterfall(y: &[Complex32], fsd: f64, span: f64) -> Waterfall {
-    let win = (fsd / 10.0).round() as usize;
+    let win = (fsd / 10.0).round_ties_even() as usize;
     let (gr, mut rows) = stft(y, fsd, win, win * 5, span, |_, r| r.to_vec()); // 0.1 s FFT, 10 Hz bins, a row every 0.5 s
     normalise(&mut rows);
     let db = rows.iter().flat_map(|r| r.iter().map(|&v| 10.0 * v.log10())).collect();
@@ -1243,6 +1423,8 @@ impl TraceResult {
             ("file", json_str(&self.file)),
             ("centre_Hz", py_float(self.centre_hz)),
             ("audio_tone_Hz", opt_f(self.audio_tone_hz)),
+            ("band_Hz", self.band_hz.map_or("null".into(), |(a, b)| format!("[\n  {},\n  {}\n ]", py_float(a), py_float(b)))),
+            ("burst", (if self.burst { "true" } else { "false" }).into()),
             ("sample_rate", self.sample_rate.to_string()),
             ("decimated_rate", py_float(self.decimated_rate)),
             ("duration_s", py_float(self.duration_s)),
@@ -1302,26 +1484,64 @@ pub fn run(path: &Path, o: &TraceOpts, log: &mut dyn FnMut(&str)) -> Result<Trac
     let (y, fsd) = if inp.compressed {
         (resample(rd.as_mut(), inp.n, 48000, inp.rate as usize, n as usize)?, 48000.0)
     } else {
-        let dec = ((inp.rate as f64 / TARGET).round() as usize).max(1);
+        let dec = ((inp.rate as f64 / TARGET).round_ties_even() as usize).max(1);
         (resample(rd.as_mut(), inp.n, 1, dec, (inp.n / dec as u64) as usize)?, inp.rate as f64 / dec as f64)
     };
     drop(rd);
     drop(inp);
     let mut span = o.span;
-    let mut tone = 0.0;
-    let y = if audio {
+    let (mut tone, mut dc) = (0.0, None);
+    let band = match o.band {
+        Some((a, b)) => {
+            let (lo, hi) = (a.min(b), a.max(b));
+            if hi - lo < 50.0 {
+                return Err("the band must be at least 50 Hz wide".into());
+            }
+            if !((if audio { 0.0 <= lo } else { -fsd / 2.0 < lo }) && hi < fsd / 2.0) {
+                return Err(format!("the band must lie inside the recording (+-{} Hz)", fmt_f(fsd / 2.0, 0)));
+            }
+            Some((lo, hi))
+        }
+        None => None,
+    };
+    let y = if let (true, Some(b)) = (audio, band) {
+        let (z, c) = band_shift(&y, fsd, b, true);
+        tone = c;
+        span = (b.1 - b.0) / 2.0;
+        log(&format!("  audio band {} to {} Hz", fmt_f(b.0, 0), fmt_f(b.1, 0)));
+        z
+    } else if audio {
         let re: Vec<f32> = y.iter().map(|v| v.re).collect();
         drop(y);
-        let (a, t) = to_analytic(&re, fsd);
+        let (mut a, t) = to_analytic(&re, fsd);
         tone = t;
+        remove_dc(&mut a, (5.0 * fsd) as usize);
+        dc = Some(0.0);
         span = span.min(fsd / 2.0 - 100.0);
         log(&format!("  strongest audio tone {} Hz", fmt_f(tone, 0)));
-        fc += tone;
         a
     } else {
-        y
+        let mut y = y;
+        remove_dc(&mut y, (5.0 * fsd) as usize);
+        dc = Some(0.0);
+        if let Some(b) = band {
+            let (z, c) = band_shift(&y, fsd, b, false);
+            tone = c;
+            span = (b.1 - b.0) / 2.0;
+            dc = Some(-c);
+            log(&format!("  offsets {} to {} Hz from the centre", fmt_f(b.0, 0), fmt_f(b.1, 0)));
+            z
+        } else {
+            y
+        }
     };
-    let tr = track(y, fsd, span)?;
+    fc += tone;
+    let tr = if o.burst {
+        log("  burst mode");
+        burst_track(&y, fsd, span)?
+    } else {
+        track(&y, fsd, span, dc, band.is_some())?
+    };
     let points: Vec<TracePoint> = (0..tr.t.len())
         .filter(|&i| tr.acc[i])
         .map(|i| TracePoint {
@@ -1332,7 +1552,8 @@ pub fn run(path: &Path, o: &TraceOpts, log: &mut dyn FnMut(&str)) -> Result<Trac
             snr: tr.snr[i],
         })
         .collect();
-    let wf = waterfall(&tr.y_dc, fsd, span);
+    let wf = waterfall(&y, fsd, span);
+    drop(y);
     let swing = if points.is_empty() {
         0.0
     } else {
@@ -1347,6 +1568,8 @@ pub fn run(path: &Path, o: &TraceOpts, log: &mut dyn FnMut(&str)) -> Result<Trac
         points,
         centre_hz: fc,
         audio_tone_hz: audio.then_some(tone),
+        band_hz: band,
+        burst: o.burst,
         sample_rate: rate,
         decimated_rate: fsd,
         duration_s: n as f64 / rate as f64,
@@ -1354,9 +1577,10 @@ pub fn run(path: &Path, o: &TraceOpts, log: &mut dyn FnMut(&str)) -> Result<Trac
         point_noise_hz: py_round(tr.sigma, 2),
         point_noise_pairs: tr.nsigma,
         swing_hz: py_round(swing, 1),
-        fixed_receiver_lines_hz: tr.lines.iter().filter(|&&v| v != 0.0).map(|&v| py_round(v, 1)).collect(),
-        window: WINDOW_NOTE.into(),
+        fixed_receiver_lines_hz: tr.lines.iter().filter(|&&v| dc != Some(v)).map(|&v| py_round(v, 1)).collect(),
+        window: if o.burst { BURST_WINDOW_NOTE } else { WINDOW_NOTE }.into(),
         note: None,
+        burst_hint: None,
         waterfall: wf,
     };
     res.write_csv(&res.csv_path)?;
@@ -1377,6 +1601,19 @@ pub fn run(path: &Path, o: &TraceOpts, log: &mut dyn FnMut(&str)) -> Result<Trac
         );
         log(&format!("  NOTE: {note}"));
         res.note = Some(note);
+    }
+    if !audio && !o.burst {
+        let cover = res.points.len() as f64 / tr.ninside.max(1) as f64;
+        if swing < 0.2 * span || cover < 0.3 {
+            let hint = format!(
+                "The trace covers {}% of the recording and moves {} Hz. If the satellite sends short bursts \
+                 (FSK or packets) under steady lines, run again with --burst.",
+                fmt_f(100.0 * cover, 0),
+                fmt_f(swing, 0)
+            );
+            log(&format!("  NOTE: {hint}"));
+            res.burst_hint = Some(hint);
+        }
     }
     Ok(res)
 }
@@ -1450,8 +1687,10 @@ mod tests {
     fn bad_inputs_do_not_panic() {
         assert!(parse_iso("2026-06-1\u{e9}T00:00:00Z").is_err());
         assert!(parse_iso("2026-06-14T00\u{e9}00Z").is_err());
-        assert!(track(vec![Complex32::new(0.1, 0.0); 3], 2.0, 15000.0).is_err());
-        assert!(track(Vec::new(), 48000.0, 15000.0).is_err());
+        assert!(track(&[Complex32::new(0.1, 0.0); 3], 2.0, 15000.0, Some(0.0), false).is_err());
+        assert!(track(&[], 48000.0, 15000.0, Some(0.0), false).is_err());
+        assert!(burst_track(&[Complex32::new(0.1, 0.0); 3], 2.0, 15000.0).is_err());
+        assert!(burst_track(&[], 48000.0, 15000.0).is_err());
         let mut y: Vec<Complex32> = (0..1000).map(|i| Complex32::new((i % 7) as f32, 1.0 - (i % 3) as f32)).collect();
         let orig = y.clone();
         remove_dc(&mut y, 10);
@@ -1467,8 +1706,9 @@ mod tests {
     #[test]
     fn trace_follows_injected_doppler() {
         let fs = 48000.0;
-        let y = synth(fs, 120.0);
-        let tr = track(y, fs, 15000.0).expect("track");
+        let mut y = synth(fs, 120.0);
+        remove_dc(&mut y, (5.0 * fs) as usize);
+        let tr = track(&y, fs, 15000.0, Some(0.0), false).expect("track");
         let acc: Vec<usize> = (0..tr.t.len()).filter(|&i| tr.acc[i]).collect();
         assert!(acc.len() > 100, "only {} points", acc.len());
         let worst = acc.iter().map(|&i| (tr.lc[i] - pass_model(tr.t[i], &P)).abs()).fold(0.0, f64::max);
@@ -1476,6 +1716,70 @@ mod tests {
         assert!(rms < 3.0 && worst < 15.0, "rms {rms} worst {worst}");
         assert!(tr.lines.iter().any(|l| (l - 5306.0).abs() < 5.0), "lines {:?}", tr.lines);
         assert!(tr.sigma.is_finite() && tr.sigma < 5.0);
+    }
+
+    #[test]
+    fn band_cut_keeps_only_the_band() {
+        // fftfreq grid of n = 1000 at 1000 S/s is 1 Hz; tones at 100 Hz (inside 80..120) and 300 Hz (outside)
+        let (fs, n) = (1000.0, 1000usize);
+        let w = 2.0 * std::f64::consts::PI;
+        let y: Vec<Complex32> =
+            (0..n).map(|i| { let t = i as f64 / fs; Complex32::new(((w * 100.0 * t).cos() + 2.0 * (w * 300.0 * t).cos()) as f32, 0.0) }).collect();
+        let (z, c) = band_shift(&y, fs, (80.0, 120.0), true);
+        assert_eq!(c, 100.0);
+        // audio x2 on the positive half: the 100 Hz cosine becomes exp(i 2 pi 100 t), then shifted to 0 Hz
+        assert!(z.iter().all(|v| (v.re - 1.0).abs() < 1e-5 && v.im.abs() < 1e-5), "{:?}", &z[..4]);
+        // IQ: the edges LO and HI are inside (>=, <=); -20 Hz from the centre lands on 0 Hz
+        let y: Vec<Complex32> = (0..n).map(|i| { let p = w * -20.0 * i as f64 / fs; Complex32::new(p.cos() as f32, p.sin() as f32) }).collect();
+        let (z, c) = band_shift(&y, fs, (-30.0, -20.0), false);
+        assert_eq!(c, -25.0);
+        assert!(z.iter().all(|v| (v.norm() - 1.0).abs() < 1e-5));
+        assert!(z.windows(2).all(|p| ((p[1] * p[0].conj()).arg() as f64 - w * 5.0 / fs).abs() < 1e-4));
+        let (z, _) = band_shift(&y, fs, (-19.5, 50.0), false);
+        assert!(z.iter().all(|v| v.norm() < 1e-6));
+    }
+
+    #[test]
+    fn running_median_matches_brute_force() {
+        let mut rng = Rng(12345);
+        let x: Vec<f32> = (0..300).map(|_| (rng.u() * 100.0).floor() as f32).collect();
+        for half in [0usize, 1, 5, 40, 200] {
+            let m = running_median(&x, half);
+            for i in 0..x.len() {
+                let mut w: Vec<f32> = (i as i64 - half as i64..=i as i64 + half as i64).map(|k| x[k.clamp(0, 299) as usize]).collect();
+                w.sort_by(|a, b| a.total_cmp(b));
+                assert_eq!(m[i], w[half], "half {half} i {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn burst_pass_found_under_a_steady_line() {
+        // 2-FSK bursts (+-500 Hz) 1 s in every 10 s under a steady line 2.5 times stronger, 12000 S/s, 200 s
+        let (fs, secs) = (12000.0, 200.0);
+        let p = [500.0, 2500.0, 100.0, 12.0];
+        let mut rng = Rng(7);
+        let n = (fs * secs) as usize;
+        let mut ph = 0.0f64;
+        let w = 2.0 * std::f64::consts::PI;
+        let y: Vec<Complex32> = (0..n)
+            .map(|i| {
+                let t = i as f64 / fs;
+                let bit = if ((t * 1200.0) as u64).wrapping_mul(0x9E3779B97F4A7C15) >> 63 == 1 { 500.0 } else { -500.0 };
+                ph += (pass_model(t, &p) + bit) / fs;
+                let on = if t % 10.0 < 1.0 { 0.2 } else { 0.0 };
+                let v = Complex::<f64>::from_polar(on, w * ph) + Complex::from_polar(0.5, w * 1700.0 * t)
+                    + Complex::new(0.1 * rng.gauss(), 0.1 * rng.gauss());
+                Complex32::new(v.re as f32, v.im as f32)
+            })
+            .collect();
+        let tr = burst_track(&y, fs, 5500.0).expect("burst");
+        let acc: Vec<usize> = (0..tr.t.len()).filter(|&i| tr.acc[i]).collect();
+        assert!(acc.len() >= 30, "only {} points", acc.len());
+        let worst = acc.iter().map(|&i| (tr.lc[i] - pass_model(tr.t[i], &p)).abs()).fold(0.0, f64::max);
+        let rms = (acc.iter().map(|&i| (tr.lc[i] - pass_model(tr.t[i], &p)).powi(2)).sum::<f64>() / acc.len() as f64).sqrt();
+        assert!(rms < 80.0 && worst < 400.0, "rms {rms} worst {worst} n {}", acc.len());
+        assert!(tr.lines.is_empty() && tr.sigma.is_finite());
     }
 
     /// Parity run on a real file: DOPPLER_PARITY_FILE=... DOPPLER_PARITY_OUT=... cargo test --release -- --ignored parity
@@ -1490,6 +1794,11 @@ mod tests {
             rate: std::env::var("DOPPLER_PARITY_RATE").ok().map(|v| v.parse().unwrap()),
             format: std::env::var("DOPPLER_PARITY_FORMAT").map(|v| v.parse().unwrap()).unwrap_or_default(),
             swap_iq: std::env::var("DOPPLER_PARITY_SWAP").is_ok(),
+            band: std::env::var("DOPPLER_PARITY_BAND").ok().map(|v| {
+                let (a, b) = v.split_once(',').unwrap();
+                (a.parse().unwrap(), b.parse().unwrap())
+            }),
+            burst: std::env::var("DOPPLER_PARITY_BURST").is_ok(),
             ..Default::default()
         };
         let r = run(Path::new(&f), &o, &mut |s| eprintln!("{s}")).unwrap();

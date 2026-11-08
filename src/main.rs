@@ -10,10 +10,13 @@ const USAGE: &str = "Doppler Kit: speed and closest distance of a passing source
 Usage:
   doppler-kit                      open the window
   doppler-kit trace FILE [--center HZ] [--start ISO_UTC] [--span HZ] [--rate SPS] [--format cs16|cf32|cu8] [--swap-iq] [--out DIR]
+                         [--band LO HI] [--burst]
   doppler-kit fit TRACE.csv [--c M_S] [--f0 HZ] [--out DIR]
   doppler-kit run FILE [trace options] [--c M_S] [--f0 HZ]
   doppler-kit laser SRC [--pass N] [--out DIR]      SRC: CRD file (.np2/.npt/.crd) or EDC page URL
 
+  --band LO HI: audio: track the tone between LO and HI Hz; IQ: search offsets LO to HI Hz from the centre.
+  --burst: the signal comes in short bursts (FSK/packet satellites).
   --c defaults to 299792458 (radio / light); use 343 for sound in air.";
 
 pub const LASER_EXT: [&str; 5] = ["np2", "npt", "crd", "html", "htm"];
@@ -38,7 +41,7 @@ pub fn report_text(s: &trace::TraceResult, f: &fit::FitResult, fit_json: &Path) 
         String::new(),
     ];
     l.extend(f.report_lines());
-    if let Some(n) = &s.note { l.extend([String::new(), format!("NOTE: {n}")]); }
+    for n in [&s.note, &s.burst_hint].into_iter().flatten() { l.extend([String::new(), format!("NOTE: {n}")]); }
     l.extend([String::new(), "Files:".into()]);
     l.extend([&s.csv_path, &s.summary_path, &fit_json.to_path_buf()].iter().map(|p| format!("  {}", p.display())));
     l.join("\n") + "\n"
@@ -61,15 +64,23 @@ pub fn triangle(p: &slr::Pass, f: &slr::SlrFit) -> (f64, f64, f64) {
     (tk, rk, (rk * rk - f.d_km * f.d_km).max(0.0).sqrt())
 }
 
-struct Args { pos: Vec<String>, kv: HashMap<String, String>, swap: bool }
+struct Args { pos: Vec<String>, kv: HashMap<String, String>, swap: bool, band: Option<(f64, f64)>, burst: bool }
 
 impl Args {
     fn parse(a: &[String], valued: &[&str]) -> Result<Args, String> {
-        let (mut pos, mut kv, mut swap) = (vec![], HashMap::new(), false);
+        let (mut pos, mut kv, mut swap, mut band, mut burst) = (vec![], HashMap::new(), false, None, false);
+        let traces = valued.contains(&"span");
         let mut it = a.iter();
         while let Some(x) = it.next() {
             if x == "--swap-iq" {
                 swap = true;
+            } else if traces && x == "--burst" {
+                burst = true;
+            } else if traces && x == "--band" {
+                let mut v = || -> Result<f64, String> {
+                    it.next().and_then(|s| num(s).ok().flatten()).ok_or("--band needs two numbers: LO HI".into())
+                };
+                band = Some((v()?, v()?));
             } else if let Some(k) = x.strip_prefix("--") {
                 let (k, v) = match k.split_once('=') {
                     Some((k, v)) => (k.to_string(), v.to_string()),
@@ -82,7 +93,7 @@ impl Args {
             }
         }
         if pos.len() != 1 { return Err("give exactly one input file".into()); }
-        Ok(Args { pos, kv, swap })
+        Ok(Args { pos, kv, swap, band, burst })
     }
     fn s(&self, k: &str) -> Option<String> { self.kv.get(k).cloned() }
     fn n(&self, k: &str) -> Result<Option<f64>, String> { self.kv.get(k).map_or(Ok(None), |v| num(v)) }
@@ -96,6 +107,8 @@ impl Args {
             format: self.s("format").map_or(Ok(RawFormat::Cs16), |f| f.parse())?,
             swap_iq: self.swap,
             out: self.out(),
+            band: self.band,
+            burst: self.burst,
         })
     }
     fn c(&self) -> Result<f64, String> {

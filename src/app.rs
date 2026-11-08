@@ -48,7 +48,7 @@ struct Job { path: String, opts: trace::TraceOpts, c: f64, f0: Option<f64> }
 
 struct App {
     file: String, centre: String, start: String, wave: Wave, c_other: String, f0: String, span: String,
-    rate: String, fmt: RawFormat, swap: bool, which: String, out: String,
+    rate: String, fmt: RawFormat, swap: bool, band_lo: String, band_hi: String, burst: bool, which: String, out: String,
     log: String, results: String, tab: Tab, rx: Option<Receiver<Msg>>,
     trace: Option<trace::TraceResult>, fit: Option<(fit::FitResult, PathBuf)>, laser: Option<(slr::SlrRun, String)>,
     wf_tex: Option<TextureHandle>,
@@ -62,7 +62,7 @@ impl Default for App {
     fn default() -> Self {
         App {
             file: String::new(), centre: String::new(), start: String::new(), wave: Wave::Radio, c_other: String::new(),
-            f0: String::new(), span: "15000".into(), rate: String::new(), fmt: RawFormat::Cs16, swap: false, which: "0".into(),
+            f0: String::new(), span: "15000".into(), rate: String::new(), fmt: RawFormat::Cs16, swap: false, band_lo: String::new(), band_hi: String::new(), burst: false, which: "0".into(),
             out: String::new(), log: String::new(), results: String::new(), tab: Tab::Results, rx: None,
             trace: None, fit: None, laser: None, wf_tex: None, run: 0, show_trace: true, picker: None,
         }
@@ -234,6 +234,14 @@ impl App {
         let Some(center) = self.num(&centre, "centre") else { return };
         let Some(f0) = self.num(&f0s, "f0") else { return };
         let Some(span) = self.num(&spans, "search span") else { return };
+        let (los, his) = (self.band_lo.clone(), self.band_hi.clone());
+        let Some(lo) = self.num(&los, "tone band low") else { return };
+        let Some(hi) = self.num(&his, "tone band high") else { return };
+        let band = match (lo, hi) {
+            (Some(a), Some(b)) => Some((a, b)),
+            (None, None) => None,
+            _ => { self.log += "Stopped: give both tone band limits, or neither\n"; return; }
+        };
         let Some(rate) = self.num(&rates, "sample rate") else { return };
         let c = match self.wave {
             Wave::Radio => fit::C_LIGHT,
@@ -246,7 +254,7 @@ impl App {
         };
         let out = Some(self.out.trim()).filter(|s| !s.is_empty()).map(PathBuf::from);
         let start = Some(self.start.trim().to_string()).filter(|s| !s.is_empty());
-        let opts = trace::TraceOpts { center, start, span: span.unwrap_or(15000.0), rate, format: self.fmt, swap_iq: self.swap, out };
+        let opts = trace::TraceOpts { center, start, span: span.unwrap_or(15000.0), rate, format: self.fmt, swap_iq: self.swap, out, band, burst: self.burst };
         self.trace = None;
         self.fit = None;
         self.laser = None;
@@ -365,6 +373,11 @@ impl App {
             ui.end_row();
             ui.label("Q stored before I");
             ui.checkbox(&mut self.swap, "swap IQ");
+            ui.end_row();
+            field(ui, "Tone band low (Hz, optional)", &mut self.band_lo);
+            field(ui, "Tone band high (Hz, optional)", &mut self.band_hi);
+            ui.label("Burst signal");
+            ui.checkbox(&mut self.burst, "short FSK bursts (satellites)");
             ui.end_row();
             field(ui, "Laser file: pass to plot", &mut self.which);
             ui.label("Output folder (blank: next to file)");

@@ -78,7 +78,7 @@ Save writes the files again into the output folder.
 ## The command line
 
 ```
-doppler-kit trace FILE [--center HZ] [--start ISO_UTC] [--span HZ] [--rate SPS] [--format cs16|cf32|cu8] [--swap-iq] [--out DIR]
+doppler-kit trace FILE [--center HZ] [--start ISO_UTC] [--span HZ] [--rate SPS] [--format cs16|cf32|cu8] [--swap-iq] [--out DIR] [--band LO HI] [--burst]
 doppler-kit fit TRACE.csv [--c M_S] [--f0 HZ] [--out DIR]
 doppler-kit run FILE [trace options] [--c M_S] [--f0 HZ]
 doppler-kit laser SRC [--pass N] [--out DIR]
@@ -98,6 +98,8 @@ doppler-kit run iq_5408034.raw --rate 48000 --center 437800000            # raw 
 doppler-kit run capture.cf32 --rate 250000 --center 437800000 --format cf32
 doppler-kit run beacon_usb.ogg --center 145796000                         # receiver audio, dial frequency
 doppler-kit run horn.wav --c 343                                          # sound
+doppler-kit run aircraft.wav --band 1300 2700 --c 343.8                   # sound: engine tone between 1300 and 2700 Hz
+doppler-kit run pocketqube.cf32 --rate 48000 --center 436650000 --format cf32 --burst   # short FSK bursts
 doppler-kit laser https://edc.dgfi.tum.de/en/data/npt2/1166240/           # one pass, from its EDC page
 doppler-kit laser icesat2_20261025.np2 --pass 3                           # a daily CRD file, pass 3
 ```
@@ -110,6 +112,8 @@ Options:
 - `--rate`: the sample rate of a raw IQ file.
 - `--format`: the sample type of a raw IQ file. The default is `cs16`.
 - `--swap-iq`: Q is stored before I.
+- `--band LO HI`: search only this band. See "Tone band" below.
+- `--burst`: the signal comes in short bursts. See "Burst signals" below.
 - `--c`: the wave speed in m/s. The default is 299792458 (radio and light). Use 343 for sound in air.
 - `--f0`: fix the transmitted frequency.
 - `--out`: the output folder. The default is the folder of the input file.
@@ -120,12 +124,35 @@ On Windows the program does not open a console window of its own.
 The command line writes to the console it was started from.
 In `cmd` the prompt can come back before the output ends. Use `start /wait doppler-kit run ...` to wait for it.
 
+### Tone band (`--band LO HI`)
+
+Use it when a different sound or signal is stronger than the one you want.
+For example, the low rumble of an aircraft engine (50 to 135 Hz) is often stronger than the engine tone.
+Without a band, the trace jumps between the two.
+
+- Audio: LO and HI are audio frequencies in Hz. The kit uses only the sound between LO and HI.
+- IQ: LO and HI are offsets in Hz from the centre frequency, for example `--band -5000 3000`.
+
+Look at the waterfall or a spectrum of the recording first. Choose a band that holds the whole S-curve of the tone
+and leaves out the other strong sounds. The search span is then half the band width.
+
+### Burst signals (`--burst`)
+
+Some satellites do not send a steady carrier. They send short packets (FSK) every few seconds.
+The recording can also hold steady lines from the receiver or from other transmitters, and these lines can be stronger than the packets.
+The normal tracer then follows a steady line or only part of a packet.
+`--burst` finds the packets under the steady lines and gives one point for each half second that holds a packet.
+The trace file has the same columns, so `fit` works the same way.
+
+When you do not give `--burst` and the trace covers less than 30% of an IQ recording, or moves less than a fifth of the span,
+the kit prints a note that suggests `--burst`.
+
 ## Output
 
 | File | Content |
 |---|---|
 | `<name>_trace.csv` | `t_s, utc, f_offset_Hz, f_Hz, snr_dB`: received frequency against time |
-| `<name>_summary.json` | settings, number of points, point noise, the frequency swing, fixed receiver lines found |
+| `<name>_summary.json` | settings (with `band_Hz` and `burst`), number of points, point noise, the frequency swing, fixed receiver lines found |
 | `<name>_fit.json` | v, d, t₀, f₀ with errors (full fit), the plateau estimate, the marks, the path test, the distances at the first and last point |
 | `<name>_slr.csv` | laser ranging: v, d, closest time, shots and fit miss for every pass |
 
@@ -136,7 +163,8 @@ Record at a **fixed frequency with Doppler correction off**, through the whole p
 - a WAV file with 2 channels (I and Q), 8-bit, 16-bit or 32-bit, such as an SDR++ "baseband" recording,
 - a headerless raw IQ file (`.raw`, `.cs16`, `.cf32`, `.cu8`, `.sigmf-data`) with its sample rate, or
 - audio: a 1-channel WAV, `.ogg`, `.mp3`, `.flac`, `.m4a`, `.opus` or `.aac`. This can be a receiver's audio output
-  in USB or CW mode, or a plain sound recording of a passing source. The strongest tone is tracked.
+  in USB or CW mode, or a plain sound recording of a passing source. The strongest tone is tracked,
+  or the tone inside a band you give with `--band`.
 
 A cheap RTL-SDR and a simple antenna are enough for the ISS (437.800 MHz FM repeater, 145.800 MHz voice).
 
@@ -163,6 +191,22 @@ The ISS carrier stays within about 270 Hz for the whole pass. A pass recorded at
    and it lies within 4 sigma of a smoothing spline. Sigma (the point noise) comes from second differences.
 
 Points are 0.25 s apart but each uses a 1 s window, so only every 4th point is independent. The fit allows for this in its errors.
+
+**With `--band LO HI`**
+
+1. One FFT of the whole recording. All bins outside LO to HI are set to zero (for audio also all negative frequencies).
+   Then the inverse FFT, and the band centre is moved to 0 Hz. The search span is (HI − LO)/2.
+2. The steps above follow. In each measuring pass, the bins that came from outside the band are left out.
+   The noise floor of a spectrum is the median of the bins inside the band.
+3. Audio has no receiver DC line and no fixed receiver lines, so nothing is blanked. A tone that stays on one plateau for most of the clip stays in the trace.
+
+**With `--burst`**
+
+1. Spectra of 0.5 s (Hann window, no overlap), smoothed over 100 Hz.
+2. Every bin is divided by its running median over ±20 s. A steady line, present most of the time, goes to 1. A short packet stands above 1.
+3. In each spectrum, take the 2000 Hz band with the most excess power. Keep the spectrum when that band is 6 dB or more above the floor.
+4. The point is the power centroid of the excess in that band. For a packet with two FSK tones, this is the middle between the two tones.
+5. Fit the S-curve shape to all points with a robust fit, from 45 start values. Drop the points more than 800 Hz from that curve.
 
 **The fit**
 
@@ -203,6 +247,37 @@ The window takes `.np2`, `.npt` and `.crd` files and EDC page URLs.
 
 Example: ICESat-2 past Herstmonceux (UK) on 25 October 2026, 44 shots. The last shot, 115.9 s after closest approach,
 is 1,009.8 km away: √(1,009.8² − 537.3²) = 855.0 km along the path, and 855.0 / 115.9 = 7.38 km/s.
+
+## Tested recordings
+
+Recordings made by others, measured with the kit alone. No position, orbit or flight data went into the measurement.
+
+**Aircraft sound** (`--band`, `--c 343.8`). Reference: a straight-line fit to the ADS-B positions over 10 s around closest approach.
+
+| Aircraft (ICAO) | Band (Hz) | Kit: v | Kit: d | ADS-B: v | ADS-B: d |
+|---|---|---|---|---|---|
+| 7C6D29 | 1300 to 2700 | 82.0 ± 1.4 m/s | 229 ± 15 m | 82.9 m/s | 224 m |
+| 7C6DA0 | 1300 to 2600 | 79.6 ± 1.5 m/s | 244 ± 15 m | 80.4 m/s | 223 m |
+| 7C77D9 | 2000 to 4000 | 73.0 ± 2.3 m/s | 255 ± 26 m | 74.2 m/s | 246 m |
+| 7C7773 | 1500 to 3000 | 107 ± 10 m/s | 735 ± 164 m | 74.8 m/s | 290 m |
+
+In the 7C7773 clip the tone stops at 12.5 s, before the falling half of the S-curve. The fit has only one plateau to work with.
+
+Data: Downward, B. (2023). *AeroSonicDB (YPAD-0523): Labelled audio dataset for acoustic detection and classification of aircraft* (Version 0.3) [Data set]. Zenodo. https://doi.org/10.5281/zenodo.8004108 (https://zenodo.org/records/8004108, licence on the Zenodo page: CC BY 4.0).
+ADS-B positions: ADS-B Exchange, historical data samples, https://www.adsbexchange.com/
+
+**Satellites** (`--burst`). Reference: published-orbit model (TLE), straight-line fit over the same time span.
+
+| Satellite | Kit: v | Kit: d | Kit: t₀ (UTC) | Published-orbit model (TLE): v | d |
+|---|---|---|---|---|---|
+| DELFI-PQ, 2022-01-16, 436.650 MHz | 7.234 ± 0.027 km/s | 890.9 ± 10.7 km | 17:58:57.11 | 7.238 km/s | 889.7 km |
+| HADES-D, 2023-12-09, 436.666 MHz | 7.41 ± 0.15 km/s | 564 ± 28 km | 11:21:17.35 | 7.355 km/s | 544.8 km |
+
+Data: Estévez, D. (2022). *Recording of DELFI-PQ/EASAT-2/HADES PocketQubes and other amateur satellites in the SpaceX Transporter 3 launch with the Allen Telescope Array on 2022-01-16* [Data set]. Zenodo. https://doi.org/10.5281/zenodo.5876090 (https://zenodo.org/records/5876090, CC BY 4.0).
+
+Estévez, D. (2023). *Recording of HADES-D satellite* [Data set]. Zenodo. https://doi.org/10.5281/zenodo.10343047 (https://zenodo.org/records/10343047, CC BY 4.0).
+
+The kit read narrow channels cut from these wideband recordings: 48,000 S/s around 436.650 MHz (DELFI-PQ), and 50,000 S/s around 436.666 MHz for the second part of the HADES-D recording.
 
 ## Related
 
