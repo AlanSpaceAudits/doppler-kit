@@ -1,0 +1,35 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-22.04, target: x86_64-unknown-linux-gnu, name: doppler-kit-linux-x86_64 }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, name: doppler-kit-windows-x86_64.exe }
+          - { os: macos-14, target: aarch64-apple-darwin, name: doppler-kit-macos-arm64 }
+          - { os: macos-14, target: x86_64-apple-darwin, name: doppler-kit-macos-x86_64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Rename binary
+        shell: bash
+        run: |
+          src=target/${{ matrix.target }}/release/doppler-kit
+          [ -f "$src.exe" ] && src="$src.exe"
+          cp "$src" "${{ matrix.name }}"
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.name }}
