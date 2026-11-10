@@ -16,7 +16,7 @@ Usage:
   doppler-kit laser SRC [--pass N] [--out DIR]      SRC: CRD file (.np2/.npt/.crd) or EDC page URL
 
   --band LO HI: audio: track the tone between LO and HI Hz; IQ: search offsets LO to HI Hz from the centre.
-  --fm: the signal is an FM carrier (ISS SSTV, voice): trace the centre of its energy.
+  --fm: the signal is an FM carrier (ISS SSTV, voice): trace the centre of its energy; without it, tried when the normal trace is not a clean pass.
   --burst: the signal comes in short bursts (FSK/packet satellites); without it, tried when the trace looks like bursts.
   Blank options are worked out from the file (SigMF meta, WAV header, SDR++ file name, SatNOGS observation,
   file time) and logged with their source; --span blank: a scan of the whole band; --band blank (audio): the moving tone.

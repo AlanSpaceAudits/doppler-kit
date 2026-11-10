@@ -190,6 +190,10 @@ Each frame: noise = the median bin power; the strongest 2000 Hz band must be at 
 centroid of the power above 5 times the noise, within ±10 kHz of that band, with the window moved to the centroid 3 times.
 Outliers are dropped as in burst mode.
 
+When "FM carrier" is not ticked and the normal trace is not a clean pass, the kit also tries FM mode, next to burst mode.
+FM mode is used when its trace is a clean pass and, if burst mode also gives one, FM has the lower point noise and at
+least as many points. The log says which mode was used and why. A tick forces FM mode.
+
 ## Output
 
 | File | Content |

@@ -439,13 +439,13 @@ impl App {
         });
     }
 
-    /// Auto value of the last run for a field key (centre, start, rate, format, span, band, burst).
+    /// Auto value of the last run for a field key (centre, start, rate, format, span, band, burst, fm).
     fn auto_of(&self, k: &str) -> Option<String> {
         self.trace.as_ref()?.auto.iter().find(|(a, _)| a == k).map(|(_, v)| v.clone())
     }
 
     fn controls(&mut self, ui: &mut egui::Ui) {
-        let au: Vec<Option<String>> = ["centre", "start", "span", "rate", "format", "band", "burst"].iter().map(|k| self.auto_of(k)).collect();
+        let au: Vec<Option<String>> = ["centre", "start", "span", "rate", "format", "band", "burst", "fm"].iter().map(|k| self.auto_of(k)).collect();
         let small = |ui: &mut egui::Ui, a: &Option<String>| if let Some(a) = a { ui.label(RichText::new(format!("auto: {a}")).small().color(GREY)); };
         egui::Grid::new("controls").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
             ui.label("Recording");
@@ -493,7 +493,10 @@ impl App {
             });
             ui.end_row();
             ui.label("FM carrier");
-            ui.checkbox(&mut self.fm, "ISS SSTV, voice (FM)");
+            ui.vertical(|ui| {
+                ui.checkbox(&mut self.fm, "ISS SSTV, voice (FM)");
+                if !self.fm { small(ui, &au[7]); }
+            });
             ui.end_row();
             field(ui, "Laser file: pass to plot", &mut self.which);
             ui.label("Output folder (blank: next to file)");

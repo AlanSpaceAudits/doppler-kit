@@ -1970,6 +1970,7 @@ pub fn run(path: &Path, o: &TraceOpts, log: &mut dyn FnMut(&str)) -> Result<Trac
     };
     fc += tone + shift as f64;
     let mut burst = o.burst && !o.fm;
+    let mut fm = o.fm;
     let tr = if o.fm {
         log("  FM mode");
         fm_track(&y, fsd, span)?
@@ -1995,6 +1996,24 @@ pub fn run(path: &Path, o: &TraceOpts, log: &mut dyn FnMut(&str)) -> Result<Trac
         } else {
             let b = burst_track(&y, fsd, span).ok();
             let (qb_clean, qb_why, qb_cover) = match &b { Some(b) => pass_quality(b, tt, span), None => (false, "no bursts found".to_string(), 0.0) };
+            // FM is tried when the normal trace is not a clean pass. Against a clean burst trace, FM needs a lower point noise
+            // and at least as many points.
+            let normal_clean = matches!(qn, Some((true, _, _)));
+            let ft = if normal_clean { None } else { fm_track(&y, fsd, span).ok() };
+            let (qf_clean, qf_why, _) = match &ft { Some(t) => pass_quality(t, tt, span), None => (false, "no FM carrier found".to_string(), 0.0) };
+            let fm_wins = qf_clean && match (&b, &ft) { (Some(bt), Some(f)) if qb_clean => f.sigma < bt.sigma && f.nsigma >= bt.nsigma, _ => true };
+            if !normal_clean && !fm_wins {
+                let why = if qf_clean { "burst trace has lower point noise or more points".to_string() } else { format!("FM trace {qf_why}") };
+                note(log, "fm", format!("FM mode tried and not used ({why})"), "  ");
+            }
+            if fm_wins {
+                fm = true;
+                let why = match &qn { Some((_, w, _)) => format!("normal trace {w}"), None => "the normal trace found no signal".to_string() };
+                let f = ft.unwrap();
+                let vs = match &b { Some(bt) if qb_clean => format!("; point noise {} Hz over {} points, burst mode {} Hz over {}", fmt_f(f.sigma, 0), f.nsigma, fmt_f(bt.sigma, 0), bt.nsigma), _ => String::new() };
+                note(log, "fm", format!("FM mode on ({why}{vs})"), "  ");
+                f
+            } else {
             match (normal, qn) {
                 (Ok(nt), Some((qn_clean, qn_why, qn_cover))) => {
                     if qb_clean && (!qn_clean || qb_cover > qn_cover) {
@@ -2016,6 +2035,7 @@ pub fn run(path: &Path, o: &TraceOpts, log: &mut dyn FnMut(&str)) -> Result<Trac
                     note(log, "burst", "burst mode on (the normal trace found no signal)".into(), "  ");
                     b.unwrap()
                 }
+            }
             }
         }
     };
@@ -2047,7 +2067,7 @@ pub fn run(path: &Path, o: &TraceOpts, log: &mut dyn FnMut(&str)) -> Result<Trac
         audio_tone_hz: audio.then_some(tone),
         band_hz: band,
         burst,
-        fm: o.fm,
+        fm,
         sample_rate: rate,
         decimated_rate: fsd,
         duration_s: tt,
@@ -2056,7 +2076,7 @@ pub fn run(path: &Path, o: &TraceOpts, log: &mut dyn FnMut(&str)) -> Result<Trac
         point_noise_pairs: tr.nsigma,
         swing_hz: py_round(swing, 1),
         fixed_receiver_lines_hz: tr.lines.iter().filter(|&&v| dc != Some(v)).map(|&v| py_round(v, 1)).collect(),
-        window: if o.fm { FM_WINDOW_NOTE } else if burst { BURST_WINDOW_NOTE } else { WINDOW_NOTE }.into(),
+        window: if fm { FM_WINDOW_NOTE } else if burst { BURST_WINDOW_NOTE } else { WINDOW_NOTE }.into(),
         note: None,
         auto,
         waterfall: wf,
