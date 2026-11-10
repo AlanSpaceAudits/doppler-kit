@@ -384,7 +384,8 @@ impl App {
                 Msg::Trace(t) => { self.trace = Some(*t); self.tab = Tab::Waterfall; }
                 Msg::Fit(f, p) => {
                     if let Some(t) = &self.trace { self.results = crate::report_text(t, &f, &p); }
-                    self.fit = Some((*f, p));
+                    // ponytail: a failed fit is dropped so no plot or Math line shows its numbers
+                    self.fit = if f.no_pass().is_empty() { Some((*f, p)) } else { None };
                     self.tab = Tab::Results;
                 }
                 Msg::Laser(r, src, csv) => {

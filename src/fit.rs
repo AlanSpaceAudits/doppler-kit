@@ -290,7 +290,7 @@ pub fn run(t: &[f64], f: &[f64], utc: Option<&[String]>, c: f64, f0: Option<f64>
     let ts: Vec<f64> = o.iter().map(|&i| t[i]).collect();
     let fs: Vec<f64> = o.iter().map(|&i| f[i]).collect();
     let a = method_a(&ts, &fs, c, f0);
-    let p0 = [a.t0, a.v, if a.d.is_finite() && a.d > 0.0 { a.d } else { a.v * 30.0 }, a.f0];
+    let p0 = [a.t0, a.v, if a.d.is_finite() && a.d > 0.0 { a.d } else if a.v != 0.0 { a.v * 30.0 } else { 1e3 }, a.f0];
     let free: Vec<usize> = if f0.is_some() { vec![0, 1, 2] } else { vec![0, 1, 2, 3] };
     let full = |q: &[f64]| {
         let mut p = p0;
@@ -358,8 +358,11 @@ impl FitResult {
             ("range_first_m", J::F(d.range_first_m)), ("range_last_m", J::F(d.range_last_m)),
         ];
         if let Some(u) = &d.t0_utc { dd.push(("t0_utc", J::S(u.clone()))); }
+        let bad = self.no_pass();
         let root = J::O(vec![
             ("c_m_s", J::F(self.c)),
+            ("pass_found", J::B(bad.is_empty())),
+            ("no_pass_reasons", J::L(bad)),
             ("method_A", J::O(vec![("v", J::F(a.v)), ("f0", J::F(a.f0)), ("t0", J::F(a.t0)), ("d", J::F(a.d)), ("dt", J::F(a.dt))])),
             ("method_D", J::O(dd)),
             ("path", J::O(vec![("path", J::S(self.path_word().into())), ("p_value", J::F(s.p_value)),
@@ -379,8 +382,33 @@ impl FitResult {
 
     pub fn path_word(&self) -> &'static str { if self.path.bending { "bending" } else { "no bending detected" } }
 
+    /// Reasons the fit is not a pass; empty when it is one.
+    pub fn no_pass(&self) -> Vec<String> {
+        let (d, t) = (&self.d, &self.t);
+        let (t1, t2) = (t[0], t[t.len() - 1]);
+        let sv = self.err("v_m_s");
+        let mut r = Vec::new();
+        if !(d.v_m_s > 0.0 && sv > 0.0 && self.err("d_m") > 0.0) {
+            r.push("the fit could not move from its start: the data hold no Doppler change".to_string());
+            return r;
+        }
+        if !(d.t0_s >= t1 && d.t0_s <= t2) {
+            r.push(format!("closest approach falls at {} s, outside the recording ({} to {} s)", fx(d.t0_s, 1), fx(t1, 1), fx(t2, 1)));
+        }
+        if !(sv <= 0.1 * d.v_m_s) {
+            r.push(format!("speed uncertainty +/- {} m/s is more than 10% of the speed {} m/s", fx(sv, 1), fx(d.v_m_s, 1)));
+        }
+        let sd = self.err("d_m");
+        if !(sd <= 0.25 * d.d_m) {
+            r.push(format!("distance uncertainty +/- {} m is more than 25% of the distance {} m", fx(sd, 0), fx(d.d_m, 0)));
+        }
+        r
+    }
+
     /// The three lines fit_pass.py prints.
     pub fn log_text(&self) -> String {
+        let bad = self.no_pass();
+        if !bad.is_empty() { return format!("NO PASS FOUND: {}\n", bad.join("; ")); }
         let (a, d, s) = (&self.a, &self.d, &self.path);
         format!(
             "A (plateaus): v {} km/s, d {} km, f0 {} Hz\nD (full fit): v {} ± {} km/s, d {} ± {} km, t0 {} s, f0 {} Hz, left over {} Hz rms over {} points\nPath: {} (smooth pattern {} Hz rms against scatter {} Hz, p = {}; detectable from {} Hz rms)\n",
@@ -393,6 +421,13 @@ impl FitResult {
 
     /// The FULL FIT / READ OFF THE CURVE / PATH blocks of the GUI Results tab.
     pub fn report_lines(&self) -> Vec<String> {
+        let bad = self.no_pass();
+        if !bad.is_empty() {
+            let mut l = vec!["NO PASS FOUND (no speed or distance is given)".to_string()];
+            l.extend(bad.iter().map(|b| format!("  {b}")));
+            l.push("  The fit always returns its best match. These checks show that match is not a pass.".into());
+            return l;
+        }
         let (d, a, m, s) = (&self.d, &self.a, &self.marks, &self.path);
         let km = self.c > 1e5;
         let l = |x: f64| if km { format!("{} km", fcomma(x / 1e3, 2)) } else { format!("{} m", fcomma(x, 2)) };
@@ -428,7 +463,7 @@ impl FitResult {
     }
 }
 
-enum J<'a> { F(f64), I(i64), S(String), A(Vec<f64>), O(Vec<(&'a str, J<'a>)>) }
+enum J<'a> { F(f64), I(i64), B(bool), S(String), L(Vec<String>), A(Vec<f64>), O(Vec<(&'a str, J<'a>)>) }
 
 impl J<'_> {
     fn write(&self, s: &mut String, ind: usize) {
@@ -436,6 +471,18 @@ impl J<'_> {
         match self {
             J::F(x) => s.push_str(&py_float(*x)),
             J::I(i) => s.push_str(&i.to_string()),
+            J::B(b) => s.push_str(if *b { "true" } else { "false" }),
+            J::L(v) if v.is_empty() => s.push_str("[]"),
+            J::L(v) => {
+                s.push_str("[\n");
+                for (i, x) in v.iter().enumerate() {
+                    s.push_str(&pad(ind + 1));
+                    J::S(x.clone()).write(s, ind + 1);
+                    s.push_str(if i + 1 < v.len() { ",\n" } else { "\n" });
+                }
+                s.push_str(&pad(ind));
+                s.push(']');
+            }
             J::S(t) => { s.push('"'); s.push_str(&t.replace('\\', "\\\\").replace('"', "\\\"")); s.push('"'); }
             J::A(v) => {
                 s.push_str("[\n");
@@ -611,6 +658,16 @@ mod tests {
         assert_eq!(r.path_word(), "no bending detected");
         assert!(r.err("v_m_s") > 0.0 && r.marks.dt_s > 0.0);
         assert!(r.to_json().contains("\"method_D\""));
+        assert!(r.no_pass().is_empty() && r.to_json().contains("\"pass_found\": true"));
+    }
+
+    #[test]
+    fn no_pass_when_signal_is_flat() {
+        let t: Vec<f64> = (0..400).map(|i| i as f64 * 0.25).collect();
+        let f: Vec<f64> = t.iter().enumerate().map(|(i, _)| 1.4e7 + [3.0, -2.0, 5.0, -4.0][i % 4]).collect();
+        let r = run(&t, &f, None, C_LIGHT, None, 0.0).unwrap();
+        assert!(!r.no_pass().is_empty());
+        assert!(r.report_lines()[0].starts_with("NO PASS FOUND") && r.log_text().starts_with("NO PASS FOUND"));
     }
 
     #[test]
