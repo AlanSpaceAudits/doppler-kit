@@ -759,21 +759,31 @@ impl App {
 
             h(ui, "The half-plateau points give the distance");
             p(ui, "A half-plateau point is where the distance changes at half the speed. Step by step:");
-            eq(ui, "1.  r' = v² τ / √(d² + v² τ²)");
-            eq(ui, "2.  set r' = −v/2 (coming) or r' = +v/2 (going)");
-            eq(ui, "3.  the frequency there:  f = f₀ / (1 ∓ v/2c)");
+            p(ui, "Step 1. The range rate (from above):");
+            eq(ui, "r' = v² τ / √(d² + v² τ²)");
+            p(ui, "Step 2. Set it to half the speed: r' = −v/2 (coming) or r' = +v/2 (going). The frequency there is:");
+            eq(ui, "f = f₀ / (1 ∓ v/2c)");
             here(ui, fit.map(|r| format!("f = {} and {}", hz(r.marks.half_plateau_hz[0]), hz(r.marks.half_plateau_hz[1]))));
-            eq(ui, "4.  v² τ / √(d² + v² τ²) = ±v/2");
-            eq(ui, "5.  2 v τ = ±√(d² + v² τ²)");
-            eq(ui, "6.  4 v² τ² = d² + v² τ²");
-            eq(ui, "7.  3 v² τ² = d²");
-            eq(ui, "8.  τ = ±d / (v √3)");
-            p(ui, "The two points are this far apart in time:");
-            eq(ui, "9.  Δt = 2 d / (v √3)");
+            p(ui, "Step 3. Put r' = ±v/2 into the range rate:");
+            eq(ui, "v² τ / √(d² + v² τ²) = ±v/2");
+            p(ui, "Step 4. Multiply both sides by 2 √(d² + v² τ²) and divide by v:");
+            eq(ui, "2 · v τ = ±√(d² + v² τ²)");
+            p(ui, "Step 5. Square both sides (2² = 4):");
+            eq(ui, "4 · v² τ² = d² + v² τ²");
+            p(ui, "Step 6. Take v² τ² from both sides (4 − 1 = 3):");
+            eq(ui, "3 · v² τ² = d²");
+            p(ui, "Step 7. Divide by 3 v² and take the square root:");
+            eq(ui, "τ = ±d / (v · √3)");
+            p(ui, "Step 8. The two points are this far apart in time (from −d/(v√3) to +d/(v√3)):");
+            eq(ui, "Δt = 2 · d / (v · √3)");
             here(ui, fit.map(|r| format!("points at {:.2} s and {:.2} s, Δt = {:.2} s", r.marks.half_plateau_t_s[0], r.marks.half_plateau_t_s[1], r.marks.dt_s)));
-            p(ui, "Turn it around:");
-            eq(ui, "10. d = Δt · v · √3/2");
+            p(ui, "Step 9. Solve for d:");
+            eq(ui, "d = Δt · v · √3/2");
             here(ui, fit.map(|r| format!("d = {:.2} s × {} × √3/2 = {}", r.marks.dt_s, spd(r.p[1]), len(r.marks.d_width_m))));
+            p(ui, "d is the closest distance along the line of sight, not the height. The Doppler curve depends only on the distance \
+                to the path, so it is the same for every direction to the path: overhead, or low in the sky to one side. \
+                d equals the height only for a pass straight overhead. To get the height you also need the direction to the source \
+                at closest approach (its elevation angle).");
             ui.add_space(8.0);
             half_plateau_diagram(ui, fit);
 
@@ -791,7 +801,8 @@ impl App {
             eq(ui, "rms = √(S / n)");
             here(ui, fit.map(|r| format!("n = {} points, rms = {:.1} Hz", r.d.n, r.d.rms_hz)));
             here(ui, fit.map(|r| format!("v = {} ± {}, d = {} ± {}", spd(r.d.v_m_s), spd(r.err("v_m_s")), len(r.d.d_m), len(r.err("d_m")))));
-            p(ui, "Errors: the points are 0.25 s apart, but each one comes from a 1 s window. So only every k-th point is independent. \
+            p(ui, "Errors: points can lie closer together than the window each one comes from (normal trace: 1 s windows every 0.25 s; \
+                FM: 1 s windows every 0.5 s; burst: 0.5 s frames, no overlap). So only every k-th point is independent. \
                 The kit allows for this: each error is √k times larger than with all points counted.");
             eq(ui, "error² = k · rms² · (the matching diagonal entry of (J^T J)⁻¹)");
             p(ui, "J is the table of how each point's f(t) changes when one value changes.");
@@ -822,6 +833,25 @@ impl App {
             here(ui, fit.map(|r| format!("A_min = {:.1} Hz rms (this recording)", r.path.detectable_rms_hz)));
 
             h(ui, "How the trace is measured");
+            let mode = self.trace.as_ref().map(|t| if t.fm { "fm" } else if t.burst { "burst" } else { "normal" }).unwrap_or("normal");
+            if mode == "fm" {
+            p(ui, "FM mode (this run). An FM signal is spread over about 15 kHz, and its strongest part jumps around the carrier \
+                with the picture or voice. The mean frequency of an FM signal is its carrier, so the kit measures the centre of the energy.");
+            p(ui, "1.  Lower the sample rate to about 48,000 samples a second. Remove the receiver's DC line.");
+            p(ui, "2.  1.0 s Hann windows every 0.5 s. Noise of a frame = its median bin power.");
+            p(ui, "3.  Keep a frame when its strongest 2000 Hz band is at least 15 dB over the noise.");
+            p(ui, "4.  The value is the centroid of the power above 5 × the noise, within ±10 kHz of that band. \
+                The window moves to the centroid and the centroid is taken again, 3 times.");
+            p(ui, "5.  A soft-L1 fit of the pass shape from a grid of starts; points more than 800 Hz off it are dropped. \
+                The point noise is the spread of the rest around that shape.");
+            } else if mode == "burst" {
+            p(ui, "Burst mode (this run), for short FSK packets under steady lines.");
+            p(ui, "1.  Lower the sample rate to about 48,000 samples a second. Remove the receiver's DC line.");
+            p(ui, "2.  0.5 s Hann frames, no overlap; 100 Hz smoothing across frequency; each bin divided by its running median over ±20 s, \
+                so steady lines go to 1. Excess = ratio − 1.");
+            p(ui, "3.  Keep a frame when its strongest 2000 Hz band of excess is at least 6 dB. The value is the centroid of the excess in that band.");
+            p(ui, "4.  A soft-L1 fit of the pass shape from a grid of starts; points more than 800 Hz off it are dropped.");
+            } else {
             p(ui, "1.  Lower the sample rate to about 48,000 samples a second. Remove the receiver's DC line.");
             p(ui, "2.  Find the signal: 0.25 s spectra, every bin and every frame divided by its median, fixed receiver lines masked, \
                 the strongest 300 Hz band in each frame. A smooth S-shaped curve through it steers the next steps only.");
@@ -830,6 +860,7 @@ impl App {
                 each time with a better reference. The value is the noise-subtracted power centroid in the band.");
             p(ui, "4.  Keep a point when its peak is more than 14 dB above the frame median, it is not on a fixed receiver line, \
                 and it lies within 4 sigma of a smoothing spline. Sigma (the point noise) comes from second differences.");
+            }
             here(ui, self.trace.as_ref().map(|t| format!("{} points, point noise {:.1} Hz, swing {}", t.points.len(), t.point_noise_hz, hz(t.swing_hz))));
             p(ui, "The waterfall picture: 0.1 s spectra every 0.5 s with 10 Hz bins, each bin in dB above the medians of its column and row.");
 
@@ -939,7 +970,7 @@ mod tests {
         let (w, h) = (1400u32, std::env::var("DK_SHOT_H").ok().and_then(|v| v.parse().ok()).unwrap_or(900u32));
         let ctx = egui::Context::default();
         ctx.set_theme(egui::Theme::Dark);
-        let mut app = App { file: input, centre: std::env::var("DK_SHOT_CENTER").unwrap_or_default(), ..App::default() };
+        let mut app = App { file: input, centre: std::env::var("DK_SHOT_CENTER").unwrap_or_default(), fm: std::env::var("DK_SHOT_FM").is_ok(), ..App::default() };
         app.start(&ctx);
         while app.rx.is_some() { app.poll(); std::thread::sleep(std::time::Duration::from_millis(50)); }
         print!("{}", app.log);
