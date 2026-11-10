@@ -80,7 +80,7 @@ Save writes the files again into the output folder.
 ## The command line
 
 ```
-doppler-kit trace FILE [--center HZ] [--start ISO_UTC] [--span HZ] [--rate SPS] [--format cs16|cf32|cu8] [--swap-iq] [--out DIR] [--band LO HI] [--burst]
+doppler-kit trace FILE [--center HZ] [--start ISO_UTC] [--span HZ] [--rate SPS] [--format cs16|cf32|cu8] [--swap-iq] [--out DIR] [--band LO HI] [--burst] [--fm]
 doppler-kit fit TRACE.csv [--c M_S] [--f0 HZ] [--out DIR]
 doppler-kit run FILE [trace options] [--c M_S] [--f0 HZ]
 doppler-kit laser SRC [--pass N] [--out DIR]
@@ -116,6 +116,7 @@ Options:
 - `--swap-iq`: Q is stored before I.
 - `--band LO HI`: search only this band. See "Tone band" below.
 - `--burst`: the signal comes in short bursts. See "Burst signals" below.
+- `--fm`: the signal is an FM carrier (ISS SSTV, voice). See "FM carriers" below.
 - `--c`: the wave speed in m/s. The default is 299792458 (radio and light). Use 343 for sound in air.
 - `--f0`: fix the transmitted frequency.
 - `--out`: the output folder. The default is the folder of the input file.
@@ -177,6 +178,17 @@ The normal tracer then follows a steady line or only part of a packet.
 The trace file has the same columns, so `fit` works the same way.
 
 When you do not give `--burst`, the kit tries burst mode by itself when the trace looks like bursts (see "Blank fields").
+
+### FM carriers (`--fm`)
+
+Some satellites send FM: the ISS sends SSTV pictures and voice on 145.800 MHz. FM spreads the signal over about 15 kHz,
+and the strongest part of the spectrum jumps around the carrier, so the normal tracer and burst mode follow the picture
+content, not the carrier. `--fm` (in the window: tick "FM carrier") gives one point every half second: the centre of the
+signal's energy in each 1 s frame. The mean frequency of an FM signal is its carrier.
+
+Each frame: noise = the median bin power; the strongest 2000 Hz band must be at least 15 dB over it; the point is the
+centroid of the power above 5 times the noise, within ±10 kHz of that band, with the window moved to the centroid 3 times.
+Outliers are dropped as in burst mode.
 
 ## Output
 
@@ -321,6 +333,14 @@ Data: Estévez, D. (2022). *Recording of DELFI-PQ/EASAT-2/HADES PocketQubes and 
 Estévez, D. (2023). *Recording of HADES-D satellite* [Data set]. Zenodo. https://doi.org/10.5281/zenodo.10343047 (https://zenodo.org/records/10343047, CC BY 4.0).
 
 The kit read narrow channels cut from these wideband recordings: 48,000 S/s around 436.650 MHz (DELFI-PQ), and 50,000 S/s around 436.666 MHz for the second part of the HADES-D recording.
+
+**ISS** (`--fm`). The receiver position is not published, so there is no orbit reference for this pass.
+
+| Recording | Kit: v | Kit: d | Kit: t₀ (UTC) |
+|---|---|---|---|
+| ISS SSTV, 2020-10-04, 145.800 MHz, `SDRSharp_20201004_025552Z_145449912Hz_IQ.wav` | 7.176 ± 0.034 km/s | 487.8 ± 5.5 km | 02:57:36.6 |
+
+Data: SDR# IQ recordings of ISS SSTV, 2020-10-04, Internet Archive item `sdrsharp-20201004-025552-z-145449912-hz-iq`, https://archive.org/details/sdrsharp-20201004-025552-z-145449912-hz-iq (1,024,000 S/s, 16-bit IQ, fixed tuning). The start time is the UTC time in the file name.
 
 ## Related
 

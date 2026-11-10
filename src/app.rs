@@ -48,7 +48,7 @@ struct Job { path: String, opts: trace::TraceOpts, c: f64, f0: Option<f64> }
 
 struct App {
     file: String, centre: String, start: String, wave: Wave, c_other: String, f0: String, span: String,
-    rate: String, fmt: Option<RawFormat>, swap: bool, band_lo: String, band_hi: String, burst: bool, which: String, out: String,
+    rate: String, fmt: Option<RawFormat>, swap: bool, band_lo: String, band_hi: String, burst: bool, fm: bool, which: String, out: String,
     log: String, results: String, tab: Tab, rx: Option<Receiver<Msg>>,
     trace: Option<trace::TraceResult>, fit: Option<(fit::FitResult, PathBuf)>, laser: Option<(slr::SlrRun, String)>,
     wf_tex: Option<TextureHandle>,
@@ -62,7 +62,7 @@ impl Default for App {
     fn default() -> Self {
         App {
             file: String::new(), centre: String::new(), start: String::new(), wave: Wave::Radio, c_other: String::new(),
-            f0: String::new(), span: String::new(), rate: String::new(), fmt: None, swap: false, band_lo: String::new(), band_hi: String::new(), burst: false, which: "0".into(),
+            f0: String::new(), span: String::new(), rate: String::new(), fmt: None, swap: false, band_lo: String::new(), band_hi: String::new(), burst: false, fm: false, which: "0".into(),
             out: String::new(), log: String::new(), results: String::new(), tab: Tab::Results, rx: None,
             trace: None, fit: None, laser: None, wf_tex: None, run: 0, show_trace: true, picker: None,
         }
@@ -351,7 +351,7 @@ impl App {
         };
         let out = Some(self.out.trim()).filter(|s| !s.is_empty()).map(PathBuf::from);
         let start = Some(self.start.trim().to_string()).filter(|s| !s.is_empty());
-        let opts = trace::TraceOpts { center, start, span, rate, format: self.fmt, swap_iq: self.swap, out, band, burst: self.burst };
+        let opts = trace::TraceOpts { center, start, span, rate, format: self.fmt, swap_iq: self.swap, out, band, burst: self.burst, fm: self.fm };
         self.trace = None;
         self.fit = None;
         self.laser = None;
@@ -491,6 +491,9 @@ impl App {
                 ui.checkbox(&mut self.burst, "short FSK bursts (satellites)");
                 if !self.burst { small(ui, &au[6]); }
             });
+            ui.end_row();
+            ui.label("FM carrier");
+            ui.checkbox(&mut self.fm, "ISS SSTV, voice (FM)");
             ui.end_row();
             field(ui, "Laser file: pass to plot", &mut self.which);
             ui.label("Output folder (blank: next to file)");

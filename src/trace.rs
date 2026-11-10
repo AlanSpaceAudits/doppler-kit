@@ -37,6 +37,15 @@ const BURST_BAND_HZ: f64 = 2000.0;
 const BURST_THR_DB: f64 = 6.0;
 const BURST_FSCALE_HZ: f64 = 300.0;
 const BURST_GATE_HZ: f64 = 800.0;
+const FM_FRAME_S: f64 = 1.0;
+const FM_HOP_S: f64 = 0.5;
+const FM_BAND_HZ: f64 = 2000.0;
+const FM_HALF_HZ: f64 = 10000.0;
+const FM_NOISE_K: f32 = 5.0;
+const FM_THR_DB: f64 = 15.0;
+const FM_ITER: usize = 3;
+pub const FM_WINDOW_NOTE: &str = "1.0 s Hann, 0.5 s hop (only every 2nd point is independent)";
+pub const NO_FM: &str = "no FM carrier found: check --center, --span and --band";
 pub const NOT_FOUND: &str = "signal not found: check --center, --span and --swap-iq";
 pub const WINDOW_NOTE: &str = "1.0 s Hann, 0.25 s hop (only every 4th point is independent)";
 pub const BURST_WINDOW_NOTE: &str = "0.5 s Hann frames, no overlap";
@@ -57,11 +66,13 @@ pub struct TraceOpts {
     pub band: Option<(f64, f64)>,
     /// Short-burst mode (FSK/packet satellites); off: tried when the trace looks like bursts.
     pub burst: bool,
+    /// FM carrier (ISS SSTV, voice): the energy centre of each frame.
+    pub fm: bool,
 }
 
 impl Default for TraceOpts {
     fn default() -> Self {
-        Self { center: None, start: None, span: None, rate: None, format: None, swap_iq: false, out: None, band: None, burst: false }
+        Self { center: None, start: None, span: None, rate: None, format: None, swap_iq: false, out: None, band: None, burst: false, fm: false }
     }
 }
 
@@ -91,6 +102,7 @@ pub struct TraceResult {
     pub audio_tone_hz: Option<f64>,
     pub band_hz: Option<(f64, f64)>,
     pub burst: bool,
+    pub fm: bool,
     pub sample_rate: u32,
     pub decimated_rate: f64,
     pub duration_s: f64,
@@ -1152,6 +1164,60 @@ pub fn burst_track(y: &[Complex32], fsd: f64, span: f64) -> Result<Track, String
     Ok(Track { t: gr.t.clone(), lc, snr, acc, sigma: mad(&r), nsigma: nsig, lines: Vec::new(), ninside: 0 })
 }
 
+/// FM mode: 1.0 s Hann frames every 0.5 s; noise = median bin power of the frame; the strongest 2000 Hz band (boxcar)
+/// must be >= 15 dB over it; value = centroid of max(P - 5 noise, 0) within +-10000 Hz, the window started on that band
+/// and moved to the centroid 3 times (the mean of an FM signal's frequency is its carrier). Outliers as in burst mode.
+pub fn fm_track(y: &[Complex32], fsd: f64, span: f64) -> Result<Track, String> {
+    let tt = y.len() as f64 / fsd;
+    let win = (FM_FRAME_S * fsd) as usize;
+    let (gr, s) = stft(y, fsd, win, (FM_HOP_S * fsd) as usize, span, |_, r| r.to_vec());
+    let nf = gr.f.len();
+    if s.len() < 2 || nf < 2 {
+        return Err(NO_FM.into());
+    }
+    let (t, f) = (&gr.t, &gr.f);
+    let df = f[1] - f[0];
+    let nb = 1usize.max((FM_BAND_HZ / df) as usize);
+    let h = (FM_HALF_HZ / df) as usize;
+    let rows: Vec<(f64, f64)> = par_map(s.len(), |i| {
+        let row = &s[i];
+        let mut srt = row.clone();
+        srt.sort_by(|a, b| a.total_cmp(b));
+        let n = srt.len();
+        let noise = if n % 2 == 1 { srt[n / 2] } else { (srt[n / 2 - 1] + srt[n / 2]) / 2.0 };
+        let b = uniform_filter_reflect(row, nb);
+        let mut j = argmax(&b);
+        let snr = 10.0 * (b[j] as f64 / (noise as f64 + 1e-30)).log10();
+        if snr < FM_THR_DB {
+            return (snr, f64::NAN);
+        }
+        let w: Vec<f64> = row.iter().map(|&p| (p - FM_NOISE_K * noise).max(0.0) as f64).collect();
+        let mut c = f64::NAN;
+        for _ in 0..FM_ITER {
+            let (lo, hi) = (j.saturating_sub(h), nf.min(j + h + 1));
+            let sw = crate::lm::np_sum(&w[lo..hi]);
+            if sw <= 0.0 {
+                return (snr, f64::NAN);
+            }
+            let wf: Vec<f64> = (lo..hi).map(|k| w[k] * f[k]).collect();
+            c = crate::lm::np_sum(&wf) / sw;
+            j = (0..nf).fold(0, |m, k| if (f[k] - c).abs() < (f[m] - c).abs() { k } else { m });
+        }
+        (snr, c)
+    });
+    let (snr, lc): (Vec<f64>, Vec<f64>) = rows.into_iter().unzip();
+    let det: Vec<bool> = lc.iter().map(|v| v.is_finite()).collect();
+    if det.iter().filter(|&&v| v).count() <= 10 {
+        return Err(NO_FM.into());
+    }
+    let (td, ld) = (select(t, &det), select(&lc, &det));
+    let p = robust_pass(&td, &ld, tt, span);
+    let acc: Vec<bool> = (0..t.len()).map(|i| det[i] && (lc[i] - pass_model(t[i], &p)).abs() < BURST_GATE_HZ).collect();
+    let r: Vec<f64> = (0..t.len()).filter(|&i| acc[i]).map(|i| lc[i] - pass_model(t[i], &p)).collect();
+    let nsig = r.len();
+    Ok(Track { t: gr.t.clone(), lc, snr, acc, sigma: mad(&r), nsigma: nsig, lines: Vec::new(), ninside: 0 })
+}
+
 /// Zero everything outside lo..hi in one FFT of the whole signal (audio: also the negative frequencies, x2 keeps
 /// the amplitude) and move the band centre to 0 Hz. Returns the signal and the centre (Hz). The cut comes first:
 /// the dechirp passes shift the spectrum by up to the swing and would pull outside sound into the search window.
@@ -1675,6 +1741,7 @@ impl TraceResult {
             ("audio_tone_Hz", opt_f(self.audio_tone_hz)),
             ("band_Hz", self.band_hz.map_or("null".into(), |(a, b)| format!("[\n  {},\n  {}\n ]", py_float(a), py_float(b)))),
             ("burst", (if self.burst { "true" } else { "false" }).into()),
+            ("fm", (if self.fm { "true" } else { "false" }).into()),
             ("sample_rate", self.sample_rate.to_string()),
             ("decimated_rate", py_float(self.decimated_rate)),
             ("duration_s", py_float(self.duration_s)),
@@ -1902,8 +1969,11 @@ pub fn run(path: &Path, o: &TraceOpts, log: &mut dyn FnMut(&str)) -> Result<Trac
         }
     };
     fc += tone + shift as f64;
-    let mut burst = o.burst;
-    let tr = if burst {
+    let mut burst = o.burst && !o.fm;
+    let tr = if o.fm {
+        log("  FM mode");
+        fm_track(&y, fsd, span)?
+    } else if burst {
         log("  burst mode");
         burst_track(&y, fsd, span)?
     } else {
@@ -1977,6 +2047,7 @@ pub fn run(path: &Path, o: &TraceOpts, log: &mut dyn FnMut(&str)) -> Result<Trac
         audio_tone_hz: audio.then_some(tone),
         band_hz: band,
         burst,
+        fm: o.fm,
         sample_rate: rate,
         decimated_rate: fsd,
         duration_s: tt,
@@ -1985,7 +2056,7 @@ pub fn run(path: &Path, o: &TraceOpts, log: &mut dyn FnMut(&str)) -> Result<Trac
         point_noise_pairs: tr.nsigma,
         swing_hz: py_round(swing, 1),
         fixed_receiver_lines_hz: tr.lines.iter().filter(|&&v| dc != Some(v)).map(|&v| py_round(v, 1)).collect(),
-        window: if burst { BURST_WINDOW_NOTE } else { WINDOW_NOTE }.into(),
+        window: if o.fm { FM_WINDOW_NOTE } else if burst { BURST_WINDOW_NOTE } else { WINDOW_NOTE }.into(),
         note: None,
         auto,
         waterfall: wf,
@@ -2131,6 +2202,25 @@ mod tests {
         assert!(z.windows(2).all(|p| ((p[1] * p[0].conj()).arg() as f64 - w * 5.0 / fs).abs() < 1e-4));
         let (z, _) = band_shift(&y, fs, (-19.5, 50.0), false);
         assert!(z.iter().all(|v| v.norm() < 1e-6));
+    }
+
+    #[test]
+    fn fm_mode_follows_the_carrier() {
+        // FM carrier on a pass curve, 3 kHz deviation by a 1500 Hz tone: the centre of energy is the carrier.
+        let (fs, p) = (32000.0, [-1000.0, 3000.0, 30.0, 8.0]);
+        let mut ph = 0.0f64;
+        let y: Vec<Complex32> = (0..(60.0 * fs) as usize).map(|i| {
+            let t = i as f64 / fs;
+            ph += 2.0 * std::f64::consts::PI * (pass_model(t, &p) + 3000.0 * (2.0 * std::f64::consts::PI * 1500.0 * t).sin()) / fs;
+            Complex32::new(ph.cos() as f32, ph.sin() as f32)
+        }).collect();
+        let tr = fm_track(&y, fs, 15000.0).expect("fm");
+        let n = (0..tr.t.len()).filter(|&i| tr.acc[i]).count();
+        assert!(n > 100, "{n} points");
+        for i in (0..tr.t.len()).filter(|&i| tr.acc[i]) {
+            assert!((tr.lc[i] - pass_model(tr.t[i], &p)).abs() < 60.0, "t {} lc {}", tr.t[i], tr.lc[i]);
+        }
+        assert!(fm_track(&vec![Complex32::new(0.0, 0.0); 64000], fs, 15000.0).is_err());
     }
 
     #[test]
