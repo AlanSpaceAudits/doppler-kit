@@ -970,10 +970,12 @@ mod tests {
         use eframe::egui_wgpu::{wgpu, Renderer, RendererOptions, ScreenDescriptor};
         let input = std::env::var("DK_SHOT_INPUT").expect("DK_SHOT_INPUT");
         let out = std::env::var("DK_SHOT_OUT").expect("DK_SHOT_OUT");
-        let (w, h) = (1400u32, std::env::var("DK_SHOT_H").ok().and_then(|v| v.parse().ok()).unwrap_or(900u32));
+        let env_u = |k: &str, d: u32| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+        let (w, h) = (env_u("DK_SHOT_W", 1400), env_u("DK_SHOT_H", 900));
         let ctx = egui::Context::default();
         ctx.set_theme(egui::Theme::Dark);
-        let mut app = App { file: input, centre: std::env::var("DK_SHOT_CENTER").unwrap_or_default(), fm: std::env::var("DK_SHOT_FM").is_ok(), ..App::default() };
+        let mut app = App { file: input, centre: std::env::var("DK_SHOT_CENTER").unwrap_or_default(), fm: std::env::var("DK_SHOT_FM").is_ok(),
+            start: std::env::var("DK_SHOT_START").unwrap_or_default(), ..App::default() };
         app.start(&ctx);
         while app.rx.is_some() { app.poll(); std::thread::sleep(std::time::Duration::from_millis(50)); }
         print!("{}", app.log);
